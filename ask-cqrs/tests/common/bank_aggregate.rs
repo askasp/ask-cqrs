@@ -120,6 +120,7 @@ impl ask_cqrs::aggregate::Aggregate for BankAccountAggregate {
         state: &Option<Self::State>,
         command: &Self::Command,
         stream_id: &str,
+        auth_user: Self::AuthUser,
         service: Self::Service,
     ) -> Result<Vec<Self::Event>, Self::DomainError> {
         let event = match state {

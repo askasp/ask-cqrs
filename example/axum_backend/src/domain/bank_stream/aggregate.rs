@@ -7,6 +7,8 @@ use tokio::stream;
 use thiserror::Error;
 use utoipa::ToSchema;
 
+use crate::auth;
+
 use super::{command::BankAccountCommand, event::BankAccountEvent};
 
 extern crate ask_cqrs;
@@ -22,11 +24,7 @@ pub struct BankAccountState {
 
 #[derive(Debug, Error, ToSchema)]
 pub enum BankAccountError {
-    #[error("EventStore error: {0}")]
-    EventStore(#[from] eventstore::Error),
 
-    #[error("Serde error: {0}")]
-    Serde(#[from] serde_json::Error),
     #[error("Insufficient funds")]
     NotEnoughFunds,
 
@@ -42,11 +40,14 @@ pub struct BankAccountService {}
 #[derive(ToSchema)]
 pub struct BankAccountAggregate;
 
+
 impl ask_cqrs::aggregate::Aggregate for BankAccountAggregate {
     type Event = BankAccountEvent;
     type Command = BankAccountCommand;
     type DomainError = BankAccountError;
     type State = BankAccountState;
+    type AuthUser = auth::AuthUser;
+    type Service = ();
     // add external servie here, can be used when executing commands, for some it can be optional, for others it might be somehthin
 
 
@@ -84,6 +85,7 @@ impl ask_cqrs::aggregate::Aggregate for BankAccountAggregate {
         state: &Option<Self::State>,
         command: &Self::Command,
         stream_id: &str,
+        auth_user: Self::AuthUser,
         service: Self::Service,
     ) -> Result<Vec<Self::Event>, Self::DomainError> {
         let event = match state {

@@ -58,12 +58,13 @@ pub async fn execute_command<A: Aggregate>(
     client: Arc<Client>,
     command: A::Command,
     stream_id: &str,
+    auth_user: A::AuthUser,
     service: A::Service,
 ) -> Result<(), anyhow::Error> {
     tracing::info!("Executing command {:?}", stream_id);
     let (state, revision) = build_state::<A>(client.clone(), &stream_id).await?;
     tracing::info!("done ulding state for command {:?}", stream_id);
-    let events = A::execute(&state, &command, stream_id, service)?;
+    let events = A::execute(&state, &command, stream_id, auth_user, service)?;
 
     let count = events.len();
     tracing::info!("done reating events{:?} count is {:?} ", stream_id, count);

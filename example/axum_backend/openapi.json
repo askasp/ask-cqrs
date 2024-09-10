@@ -9,12 +9,12 @@
     "version": "0.1.0"
   },
   "paths": {
-    "bank-stream": {
+    "/bank-stream": {
       "post": {
         "tags": [
-          "crate"
+          "bank_stream"
         ],
-        "operationId": "handle_command",
+        "operationId": "dispatch",
         "parameters": [
           {
             "name": "Authorization",
@@ -181,47 +181,11 @@
         }
       },
       "BankAccountError": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "EventStore"
-            ],
-            "properties": {
-              "EventStore": {
-                "$ref": "#/components/schemas/eventstore.Error"
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "Serde"
-            ],
-            "properties": {
-              "Serde": {
-                "$ref": "#/components/schemas/serde_json.Error"
-              }
-            }
-          },
-          {
-            "type": "string",
-            "enum": [
-              "NotEnoughFunds"
-            ]
-          },
-          {
-            "type": "string",
-            "enum": [
-              "AlreadyOpened"
-            ]
-          },
-          {
-            "type": "string",
-            "enum": [
-              "AccountNotFound"
-            ]
-          }
+        "type": "string",
+        "enum": [
+          "NotEnoughFunds",
+          "AlreadyOpened",
+          "AccountNotFound"
         ]
       }
     }

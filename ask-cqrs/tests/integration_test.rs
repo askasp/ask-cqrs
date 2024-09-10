@@ -54,136 +54,6 @@ fn initialize_logger() {
     });
 }
 
-// #[tokio::test]
-// async fn test_aggregate_happy_path() -> Result<(), anyhow::Error> {
-//     initialize_logger();
-
-//     let user1_id = Uuid::new_v4().to_string();
-//     let command = BankAccountCommand::OpenAccount {
-//         user_id: user1_id.clone(),
-//     };
-//     let command_2 = BankAccountCommand::DepositFunds { amount: 100 };
-
-//     let client: Arc<Client> = create_es_client();
-//     let wrap_ag = AggregateWrapper::<BankAccountAggregate>::new(client);
-//     wrap_ag.dispatch_event(&user1_id, &command).await;
-//     let res = wrap_ag.dispatch_event(&user1_id, &command_2).await;
-
-//     match res {
-//         Ok(_) => Ok(()),
-//         Err(EsErrorOrDomainError::DomainError(e)) => Err(anyhow::Error::new(e)),
-//         Err(EsErrorOrDomainError::EsError(e)) => Err(anyhow::Error::new(e)),
-//     }
-// }
-
-// #[tokio::test]
-
-// async fn test_can_fund_no_account() -> Result<(), anyhow::Error> {
-//     initialize_logger();
-
-//     let user1_id = Uuid::new_v4().to_string();
-//     let command_2 = BankAccountCommand::DepositFunds { amount: 100 };
-
-//     let client: Arc<Client> = create_es_client();
-//     let wrap_ag = AggregateWrapper::<BankAccountAggregate>::new(client);
-//     let res = wrap_ag.dispatch_event(&user1_id, &command_2).await;
-//     assert!(matches!(
-//     res,
-//         Err(ref e)  if match e {
-//             EsErrorOrDomainError::DomainError(BankAccountError::AccountNotFound) => true,
-//             _ => false
-//         }
-//     ));
-
-//     Ok(())
-// }
-// #[tokio::test]
-// async fn test_account_already_oppened() -> Result<(), anyhow::Error> {
-//     initialize_logger();
-
-//     let user1_id = Uuid::new_v4().to_string();
-//     let command_2 = BankAccountCommand::OpenAccount {
-//         user_id: user1_id.clone(),
-//     };
-//     let command_3 = BankAccountCommand::OpenAccount {
-//         user_id: user1_id.clone(),
-//     };
-
-//     let client: Arc<Client> = create_es_client();
-//     let wrap_ag = AggregateWrapper::<BankAccountAggregate>::new(client);
-//     wrap_ag.dispatch_event(&user1_id, &command_2).await;
-//     let res = wrap_ag.dispatch_event(&user1_id, &command_3).await;
-//     assert!(matches!(
-//     res,
-//         Err(ref e)  if match e {
-//             EsErrorOrDomainError::DomainError(BankAccountError::AlreadyOpened) => true,
-//             _ => false
-//         }
-//     ));
-
-//     Ok(())
-// }
-
-// #[tokio::test]
-// async fn test_can_widthraw() -> Result<(), anyhow::Error> {
-//     initialize_logger();
-
-//     let user1_id = Uuid::new_v4().to_string();
-//     let command_1 = BankAccountCommand::OpenAccount {
-//         user_id: user1_id.clone(),
-//     };
-//     let command_2 = BankAccountCommand::DepositFunds { amount: 25 };
-//     let command_3 = BankAccountCommand::WithdrawFunds { amount: 12 };
-
-//     let client: Arc<Client> = create_es_client();
-//     let wrap_ag = AggregateWrapper::<BankAccountAggregate>::new(client);
-//     wrap_ag.dispatch_event(&user1_id, &command_1).await?;
-//     wrap_ag.dispatch_event(&user1_id, &command_2).await?;
-//     wrap_ag.dispatch_event(&user1_id, &command_3).await?;
-
-//     Ok(())
-// }
-// #[tokio::test]
-// async fn test_cant_overdraw() -> Result<(), anyhow::Error> {
-//     initialize_logger();
-
-//     let user1_id = Uuid::new_v4().to_string();
-//     let command_1 = BankAccountCommand::OpenAccount {
-//         user_id: user1_id.clone(),
-//     };
-//     let command_2 = BankAccountCommand::DepositFunds { amount: 12 };
-//     let command_3 = BankAccountCommand::WithdrawFunds { amount: 25 };
-
-//     let client: Arc<Client> = create_es_client();
-//     let wrap_ag = AggregateWrapper::<BankAccountAggregate>::new(client);
-//     wrap_ag.dispatch_event(&user1_id, &command_1).await?;
-//     wrap_ag.dispatch_event(&user1_id, &command_2).await?;
-//     let res = wrap_ag.dispatch_event(&user1_id, &command_3).await;
-
-//     assert!(matches!(
-//     res,
-//         Err(ref e)  if match e {
-//             EsErrorOrDomainError::DomainError(BankAccountError::NotEnoughFunds) => true,
-//             _ => false
-//         }
-//     ));
-//     Ok(())
-// }
-
-//     let res = execute_command::<BankAccountAggregate>(
-//         client.clone(),
-//         user1_id.clone().as_str(),
-//         command.clone(),
-//     )
-//     .await;
-
-//     assert!(matches!(
-//         res,
-//         Err(ref e) if e.to_string().contains("Account already exists")
-//     ));
-
-//     Ok(())
-// }
 #[tokio::test]
 async fn test_aggregate_happy_path() -> Result<(), anyhow::Error> {
     initialize_logger();
@@ -200,10 +70,16 @@ async fn test_aggregate_happy_path() -> Result<(), anyhow::Error> {
     };
 
     let client: Arc<Client> = create_es_client();
-    ask_cqrs::execute_command::<BankAccountAggregate>(client.clone(), command, &stream_id, ())
+    ask_cqrs::execute_command::<BankAccountAggregate>(client.clone(), command, &stream_id, (), ())
         .await?;
-    ask_cqrs::execute_command::<BankAccountAggregate>(client.clone(), command_2, &stream_id, ())
-        .await?;
+    ask_cqrs::execute_command::<BankAccountAggregate>(
+        client.clone(),
+        command_2,
+        &stream_id,
+        (),
+        (),
+    )
+    .await?;
 
     Ok(())
 }
@@ -221,6 +97,7 @@ async fn test_aggregate_cant_deposit_non_existend() -> Result<(), anyhow::Error>
         client,
         command_2.clone(),
         command_2.clone().stream_id().as_str(),
+        (),
         (),
     )
     .await;
@@ -256,10 +133,16 @@ async fn test_read_model_happy_path() -> Result<(), anyhow::Error> {
         account_id: stream_id.clone(),
     };
 
-    ask_cqrs::execute_command::<BankAccountAggregate>(client.clone(), command, &stream_id, ())
+    ask_cqrs::execute_command::<BankAccountAggregate>(client.clone(), command, &stream_id, (), ())
         .await?;
-    ask_cqrs::execute_command::<BankAccountAggregate>(client.clone(), command_2, &stream_id, ())
-        .await?;
+    ask_cqrs::execute_command::<BankAccountAggregate>(
+        client.clone(),
+        command_2,
+        &stream_id,
+        (),
+        (),
+    )
+    .await?;
 
     let account = bank_view.lookup(&stream_id).unwrap();
     sleep(Duration::from_millis(100)).await;
@@ -270,8 +153,14 @@ async fn test_read_model_happy_path() -> Result<(), anyhow::Error> {
     };
 
     let stream_id = open_command.stream_id();
-    ask_cqrs::execute_command::<BankAccountAggregate>(client.clone(), open_command, &stream_id, ())
-        .await?;
+    ask_cqrs::execute_command::<BankAccountAggregate>(
+        client.clone(),
+        open_command,
+        &stream_id,
+        (),
+        (),
+    )
+    .await?;
     let user_accounts = bank_view.lookup_by_tag(&user1_id);
 
     assert!(user_accounts.len() == 2);
@@ -312,12 +201,24 @@ async fn test_fraud_detection_handler() -> Result<(), anyhow::Error> {
     };
     {};
 
-    ask_cqrs::execute_command::<BankAccountAggregate>(client.clone(), command, &stream_id, ())
+    ask_cqrs::execute_command::<BankAccountAggregate>(client.clone(), command, &stream_id, (), ())
         .await?;
-    ask_cqrs::execute_command::<BankAccountAggregate>(client.clone(), command_2, &stream_id, ())
-        .await?;
-    ask_cqrs::execute_command::<BankAccountAggregate>(client.clone(), command_3, &stream_id, ())
-        .await?;
+    ask_cqrs::execute_command::<BankAccountAggregate>(
+        client.clone(),
+        command_2,
+        &stream_id,
+        (),
+        (),
+    )
+    .await?;
+    ask_cqrs::execute_command::<BankAccountAggregate>(
+        client.clone(),
+        command_3,
+        &stream_id,
+        (),
+        (),
+    )
+    .await?;
 
     sleep(Duration::from_secs(1)).await;
 

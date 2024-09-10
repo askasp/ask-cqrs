@@ -75,6 +75,7 @@ impl EventHandler for FraudDetectionHandler {
                                 },
                                 &account_id,
                                 (),
+                                (),
                             )
                             .await
                             .unwrap();
