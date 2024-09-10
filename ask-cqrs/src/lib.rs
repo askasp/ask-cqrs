@@ -15,10 +15,13 @@ pub mod aggregate;
 pub mod command;
 pub mod event;
 pub mod event_handler;
-pub mod read_model;
 pub mod view;
+
+pub use ask_cqrs_macros::commandhandler;
+
 use command::DomainCommand;
 use event::DomainEvent;
+
 
 #[instrument(skip(client))]
 async fn build_state<A: Aggregate>(

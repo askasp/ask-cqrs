@@ -85,9 +85,6 @@ impl ask_cqrs::aggregate::Aggregate for BankAccountAggregate {
     type State = BankAccountState;
     // add external servie here, can be used when executing commands, for some it can be optional, for others it might be somehthin
 
-    fn stream_revision(&self) -> u64 {
-        10
-    }
 
     fn apply_event(state: &mut Option<Self::State>, event: &Self::Event) {
         match state {

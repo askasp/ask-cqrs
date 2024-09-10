@@ -1,4 +1,4 @@
-use ask_cqrs::aggregate::{self,  EsErrorOrDomainError};
+use ask_cqrs::aggregate::{self};
 use ask_cqrs::command::DomainCommand;
 use ask_cqrs::event_handler::EventHandler;
 use ask_cqrs::execute_command;
