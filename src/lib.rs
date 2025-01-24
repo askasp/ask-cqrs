@@ -16,7 +16,6 @@ pub mod command;
 pub mod event_handler;
 pub mod view;
 
-pub use ask_cqrs_macros::commandhandler;
 
 use command::DomainCommand;
 
@@ -52,12 +51,45 @@ async fn build_state<A: Aggregate>(
     Ok((state, revision))
 }
 
-#[instrument(skip(client,command,service,views))]
+#[instrument(skip(client,command,service))]
 pub async fn execute_command<A: Aggregate>(
     client: Arc<Client>,
     command: A::Command,
     service: A::Service,
-    views: Option<Vec<Arc<ViewStore<impl View<Event = A::Event>>>>>,
+) -> Result<String, anyhow::Error> {
+    let stream_id = command.stream_id();
+    tracing::info!("Executing command {:?}", stream_id);
+    let (state, revision) = build_state::<A>(client.clone(), &stream_id).await?;
+    let events = A::execute(&state, &command, &stream_id, service)?;
+
+    let stream_name = format!("{}-{}-{}", "ask_cqrs", A::name(), stream_id);
+    for event in events {
+        let serialized_event = serde_json::to_value(&event)?;
+        let event_type = serialized_event.get("type")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Event missing 'type' field"))?;
+
+        let event_data = eventstore::EventData::json(event_type, &event)?;
+        let options = eventstore::AppendToStreamOptions::default()
+            .expected_revision(match revision {
+                None => eventstore::ExpectedRevision::NoStream,
+                Some(x) => eventstore::ExpectedRevision::Exact(x),
+            });
+
+        client
+            .append_to_stream(stream_name.clone(), &options, event_data)
+            .await?;
+    }
+
+    Ok(stream_id)
+}
+
+#[instrument(skip(client,command,service,views))]
+pub async fn execute_command_sync<A: Aggregate>(
+    client: Arc<Client>,
+    command: A::Command,
+    service: A::Service,
+    views: Vec<Arc<ViewStore<impl View<Event = A::Event>>>>,
 ) -> Result<String, anyhow::Error> {
     let stream_id = command.stream_id();
     tracing::info!("Executing command {:?}", stream_id);
@@ -81,23 +113,21 @@ pub async fn execute_command<A: Aggregate>(
         let write_result = client
             .append_to_stream(stream_name.clone(), &options, event_data)
             .await?;
-        // If views are provided, update them immediately
-        if let Some(ref views) = views {
-            // Read back the event we just wrote to get its ID
-            let position = if write_result.next_expected_version > 0 {
-                eventstore::StreamPosition::Position(write_result.next_expected_version - 1)
-            } else {
-                eventstore::StreamPosition::Start
-            };
+
+        // Read back the event we just wrote to get its ID
+        let position = if write_result.next_expected_version > 0 {
+            eventstore::StreamPosition::Position(write_result.next_expected_version - 1)
+        } else {
+            eventstore::StreamPosition::Start
+        };
+        
+        let read_options = eventstore::ReadStreamOptions::default()
+            .position(position);
             
-            let read_options = eventstore::ReadStreamOptions::default()
-                .position(position);
-                
-            let mut stream = client.read_stream(stream_name.clone(), &read_options).await?;
-            if let Ok(Some(recorded_event)) = stream.next().await {
-                for view_store in views {
-                    view_store.handle_event(&event, &stream_id, recorded_event.get_original_event());
-                }
+        let mut stream = client.read_stream(stream_name.clone(), &read_options).await?;
+        if let Ok(Some(recorded_event)) = stream.next().await {
+            for view_store in &views {
+                view_store.handle_event(&event, &stream_id, recorded_event.get_original_event());
             }
         }
     }
