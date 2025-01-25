@@ -1,4 +1,3 @@
-use utoipa::ToSchema;
 
 #[typetag::serde(tag = "type")]
 pub trait DomainCommand: Send + Sync {
