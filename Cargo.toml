@@ -8,7 +8,7 @@ edition = "2021"
 [dependencies]
 
 anyhow = "1.0.86"
-async-trait = "0.1.80"
+async-trait = "0.1.85"
 dashmap = "6.0.1"
 eventstore = "3.0.0"
 serde = "1.0.203"
