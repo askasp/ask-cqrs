@@ -7,155 +7,200 @@ use uuid::Uuid;
 mod common;
 mod test_utils;
 
-use ask_cqrs::{command::DomainCommand, execute_command, execute_command_sync, start_view_builder, view::ViewStore};
+use ask_cqrs::view::IndexView;
 use common::bank_account::{BankAccountAggregate, BankAccountCommand};
-use common::bank_account_view::BankAccountView;
-use test_utils::{create_es_client, initialize_logger};
-use eventstore::Client;
+use common::bank_account_view::{BankAccountView, UserAccountsIndexView};
+use test_utils::{initialize_logger, create_test_store};
 
 #[tokio::test]
 #[instrument]
 async fn test_bank_account_view_async() -> Result<(), anyhow::Error> {
     initialize_logger();
-    let client = create_es_client();
+    let store = create_test_store().await?;
     
-    // Start the view builder
-    let view_store = start_view_builder::<BankAccountView>(client.clone()).await?;
-
     // Generate a unique user ID for this test
     let user_id = Uuid::new_v4().to_string();
 
     // Open account
-    let open_command = BankAccountCommand::open_account(user_id);
-    let account_id = execute_command::<BankAccountAggregate>(
-        client.clone(),
+    let open_command = BankAccountCommand::open_account(user_id.clone());
+    let account_id = store.execute_command::<BankAccountAggregate>(
         open_command,
         (),
     )
     .await?;
 
-    // Wait for view to catch up
-    sleep(Duration::from_millis(100)).await;
-
     // Deposit funds
     let deposit_command = BankAccountCommand::deposit_funds(100, account_id.clone());
-    execute_command::<BankAccountAggregate>(
-        client.clone(),
+    store.execute_command::<BankAccountAggregate>(
         deposit_command,
         (),
     )
     .await?;
 
-    // Wait for view to catch up
-    sleep(Duration::from_millis(100)).await;
-
-    // Get state from view
-    let state = view_store.get(&account_id).expect("Account should exist in view");
-    assert_eq!(state.balance, 100);
+    // Get view state
+    let view = store.get_view_state::<BankAccountView>(&account_id).await?
+        .expect("Account should exist in view");
+    
+    assert_eq!(view.balance, 100);
+    assert_eq!(view.user_id, user_id);
 
     Ok(())
 }
 
 #[tokio::test]
 #[instrument]
-async fn test_bank_account_view_sync() -> Result<(), anyhow::Error> {
+async fn test_bank_account_view_multiple() -> Result<(), anyhow::Error> {
     initialize_logger();
-    let client = create_es_client();
+    let store = create_test_store().await?;
     
-    // Start the view builder
-    let view_store = start_view_builder::<BankAccountView>(client.clone()).await?;
-
-    // Generate a unique user ID for this test
-    let user_id = Uuid::new_v4().to_string();
-
-    // Open account
-    let open_command = BankAccountCommand::open_account(user_id);
-    let account_id = execute_command_sync::<BankAccountAggregate>(
-        client.clone(),
-        open_command,
-        (),
-        vec![view_store.clone()],
-    )
-    .await?;
-
-    // Deposit funds
-    let deposit_command = BankAccountCommand::deposit_funds(100, account_id.clone());
-    execute_command_sync::<BankAccountAggregate>(
-        client.clone(),
-        deposit_command,
-        (),
-        vec![view_store.clone()],
-    )
-    .await?;
-
-    // Get state from view
-    let state = view_store.get(&account_id).expect("Account should exist in view");
-    assert_eq!(state.balance, 100);
-
-    Ok(())
-}
-
-#[tokio::test]
-#[instrument]
-async fn test_bank_account_view_find() -> Result<(), anyhow::Error> {
-    initialize_logger();
-    let client = create_es_client();
-    
-    // Start the view builder
-    let view_store = start_view_builder::<BankAccountView>(client.clone()).await?;
-
     // Generate a unique user ID for this test
     let user_id = Uuid::new_v4().to_string();
 
     // Open first account
     let open_command1 = BankAccountCommand::open_account(user_id.clone());
-    let account_id1 = execute_command_sync::<BankAccountAggregate>(
-        client.clone(),
+    let account_id1 = store.execute_command::<BankAccountAggregate>(
         open_command1,
         (),
-        vec![view_store.clone()],
     )
     .await?;
 
     // Open second account
     let open_command2 = BankAccountCommand::open_account(user_id.clone());
-    let account_id2 = execute_command_sync::<BankAccountAggregate>(
-        client.clone(),
+    let account_id2 = store.execute_command::<BankAccountAggregate>(
         open_command2,
         (),
-        vec![view_store.clone()],
     )
     .await?;
 
-    // Deposit different amounts to distinguish the accounts
+    // Deposit different amounts
     let deposit_command1 = BankAccountCommand::deposit_funds(100, account_id1.clone());
-    execute_command_sync::<BankAccountAggregate>(
-        client.clone(),
+    store.execute_command::<BankAccountAggregate>(
         deposit_command1,
         (),
-        vec![view_store.clone()],
     )
     .await?;
 
     let deposit_command2 = BankAccountCommand::deposit_funds(200, account_id2.clone());
-    execute_command_sync::<BankAccountAggregate>(
-        client.clone(),
+    store.execute_command::<BankAccountAggregate>(
         deposit_command2,
         (),
-        vec![view_store.clone()],
     )
     .await?;
 
-    // Find all accounts for this user
-    let accounts = view_store.find(|state| state.user_id == user_id);
-    assert_eq!(accounts.len(), 2);
+    // Get and verify first account
+    let view1 = store.get_view_state::<BankAccountView>(&account_id1).await?
+        .expect("First account should exist in view");
+    assert_eq!(view1.balance, 100);
+    assert_eq!(view1.user_id, user_id);
 
-    // Verify we have both accounts with correct balances
-    let account1 = accounts.iter().find(|state| state.balance == 100).expect("Should find account with 100 balance");
-    let account2 = accounts.iter().find(|state| state.balance == 200).expect("Should find account with 200 balance");
+    // Get and verify second account
+    let view2 = store.get_view_state::<BankAccountView>(&account_id2).await?
+        .expect("Second account should exist in view");
+    assert_eq!(view2.balance, 200);
+    assert_eq!(view2.user_id, user_id);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[instrument]
+async fn test_user_accounts_index() -> Result<(), anyhow::Error> {
+    initialize_logger();
+    let store = create_test_store().await?;
     
-    assert_eq!(account1.user_id, user_id);
-    assert_eq!(account2.user_id, user_id);
+    // Generate two unique user IDs for this test
+    let user_id1 = Uuid::new_v4().to_string();
+    let user_id2 = Uuid::new_v4().to_string();
+
+    // Create two accounts for first user
+    let open_command1 = BankAccountCommand::open_account(user_id1.clone());
+    let account_id1 = store.execute_command::<BankAccountAggregate>(
+        open_command1,
+        (),
+    )
+    .await?;
+
+    let open_command2 = BankAccountCommand::open_account(user_id1.clone());
+    let account_id2 = store.execute_command::<BankAccountAggregate>(
+        open_command2,
+        (),
+    )
+    .await?;
+
+    // Create one account for second user
+    let open_command3 = BankAccountCommand::open_account(user_id2.clone());
+    let account_id3 = store.execute_command::<BankAccountAggregate>(
+        open_command3,
+        (),
+    )
+    .await?;
+
+    // Get the index state
+    let index_view = UserAccountsIndexView;
+    let index = store.get_index_state::<UserAccountsIndexView>().await?;
+
+    // Query accounts for first user
+    let user1_accounts = index_view.query(&index, &user_id1);
+    assert_eq!(user1_accounts.len(), 2);
+    assert!(user1_accounts.contains(&account_id1));
+    assert!(user1_accounts.contains(&account_id2));
+
+    // Query accounts for second user
+    let user2_accounts = index_view.query(&index, &user_id2);
+    assert_eq!(user2_accounts.len(), 1);
+    assert!(user2_accounts.contains(&account_id3));
+
+    // Query accounts for non-existent user
+    let non_existent_user = Uuid::new_v4().to_string();
+    let no_accounts = index_view.query(&index, &non_existent_user);
+    assert!(no_accounts.is_empty());
+
+    Ok(())
+}
+
+#[tokio::test]
+#[instrument]
+async fn test_batch_view_loading() -> Result<(), anyhow::Error> {
+    initialize_logger();
+    let store = create_test_store().await?;
+    
+    // Generate a unique user ID for this test
+    let user_id = Uuid::new_v4().to_string();
+
+    // Create multiple accounts
+    let mut account_ids = Vec::new();
+    let amounts = [100, 200, 300];
+
+    for amount in amounts {
+        // Open account
+        let open_command = BankAccountCommand::open_account(user_id.clone());
+        let account_id = store.execute_command::<BankAccountAggregate>(
+            open_command,
+            (),
+        )
+        .await?;
+
+        // Deposit funds
+        let deposit_command = BankAccountCommand::deposit_funds(amount, account_id.clone());
+        store.execute_command::<BankAccountAggregate>(
+            deposit_command,
+            (),
+        )
+        .await?;
+
+        account_ids.push(account_id);
+    }
+
+    // Load all views in a single query
+    let views = store.get_view_states::<BankAccountView>(&account_ids).await?;
+
+    // Verify all accounts were loaded with correct balances
+    assert_eq!(views.len(), 3);
+    for (i, account_id) in account_ids.iter().enumerate() {
+        let view = views.get(account_id).expect("Account should exist in views");
+        assert_eq!(view.balance, amounts[i] as u64);
+        assert_eq!(view.user_id, user_id);
+    }
 
     Ok(())
 } 

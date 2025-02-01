@@ -1,25 +1,26 @@
 use async_trait::async_trait;
-use eventstore::RecordedEvent;
 use serde::de::DeserializeOwned;
+use tokio_postgres::Row;
+use thiserror::Error;
 
+#[derive(Debug, Error)]
+#[error("{log_message}")]
 pub struct EventHandlerError {
     pub log_message: String,
-    pub nack_action: eventstore::NakAction,
 }
 
 #[async_trait]
 pub trait EventHandler: Send + Sync + 'static {
     /// The event type this handler processes
-    type Events: Send + Sync + 'static + DeserializeOwned;
+    type Events: DeserializeOwned + Send + Sync + 'static;
     /// Service dependencies
-    type Service: Send + Sync + Clone;
+    type Service: Send + Sync + 'static;
 
     fn name() -> &'static str;
     
     async fn handle_event(
         &self,
         event: Self::Events,
-        raw_event: &RecordedEvent,
-        service: Self::Service,
+        row: &Row,
     ) -> Result<(), EventHandlerError>;
 }

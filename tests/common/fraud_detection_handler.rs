@@ -1,18 +1,17 @@
-use ask_cqrs::{event_handler::EventHandler, execute_command, view::ViewStore};
+use ask_cqrs::{event_handler::{EventHandler, EventHandlerError}, postgres_store::PostgresStore};
 use async_trait::async_trait;
-use eventstore::{Client, RecordedEvent};
+use tokio_postgres::Row;
 use std::sync::Arc;
 
 use super::bank_account::{BankAccountCommand, BankAccountEvent, BankAccountAggregate};
-use super::bank_account_view::BankAccountView;
 
 pub struct FraudDetectionHandler {
-    client: Arc<Client>,
+    store: PostgresStore,
 }
 
 impl FraudDetectionHandler {
-    pub fn new(client: Arc<Client>) -> Self {
-        Self { client }
+    pub fn new(store: PostgresStore) -> Self {
+        Self { store }
     }
 
     const SUSPICIOUS_AMOUNT: u64 = 2000;
@@ -30,22 +29,19 @@ impl EventHandler for FraudDetectionHandler {
     async fn handle_event(
         &self,
         event: Self::Events,
-        raw_event: &RecordedEvent,
-        _service: Self::Service,
-    ) -> Result<(), ask_cqrs::event_handler::EventHandlerError> {
+        _row: &Row,
+    ) -> Result<(), EventHandlerError> {
         if let BankAccountEvent::FundsWithdrawn { amount, account_id } = event {
             if amount >= Self::SUSPICIOUS_AMOUNT {
                 // Suspend the account
                 let suspend_command = BankAccountCommand::suspend_account(account_id);
-                execute_command::<BankAccountAggregate>(
-                    self.client.clone(),
+                self.store.execute_command::<BankAccountAggregate>(
                     suspend_command,
                     (),
                 )
                 .await
-                .map_err(|e| ask_cqrs::event_handler::EventHandlerError {
+                .map_err(|e| EventHandlerError {
                     log_message: format!("Failed to suspend account: {}", e),
-                    nack_action: eventstore::NakAction::Park,
                 })?;
             }
         }

@@ -1,28 +1,23 @@
-use std::sync::Arc;
 use tracing::instrument;
 use uuid::Uuid;
 
 mod common;
 mod test_utils;
 
-use ask_cqrs::view::ViewStore;
 use common::bank_account::{BankAccountAggregate, BankAccountCommand, BankAccountError};
-use common::bank_account_view::BankAccountView;
-use test_utils::{create_es_client, initialize_logger};
-use ask_cqrs::{command::DomainCommand, execute_command};
+use test_utils::{initialize_logger, create_test_store};
 
 #[tokio::test]
 #[instrument]
 async fn test_bank_account_aggregate() -> Result<(), anyhow::Error> {
     initialize_logger();
-    let client = create_es_client();
+    let store = create_test_store().await?;
     
     // Test opening an account
     let user_id = Uuid::new_v4().to_string();
     let open_command = BankAccountCommand::open_account(user_id.clone());
     
-    let stream_id = ask_cqrs::execute_command::<BankAccountAggregate>(
-        client.clone(),
+    let stream_id = store.execute_command::<BankAccountAggregate>(
         open_command,
         (),
     )
@@ -31,8 +26,7 @@ async fn test_bank_account_aggregate() -> Result<(), anyhow::Error> {
     // Test depositing funds
     let deposit_command = BankAccountCommand::deposit_funds(100, stream_id.clone());
     
-    ask_cqrs::execute_command::<BankAccountAggregate>(
-        client.clone(),
+    store.execute_command::<BankAccountAggregate>(
         deposit_command,
         (),
     )
@@ -41,8 +35,7 @@ async fn test_bank_account_aggregate() -> Result<(), anyhow::Error> {
     // Test withdrawing funds successfully
     let withdraw_command = BankAccountCommand::withdraw_funds(50, stream_id.clone());
     
-    ask_cqrs::execute_command::<BankAccountAggregate>(
-        client.clone(),
+    store.execute_command::<BankAccountAggregate>(
         withdraw_command,
         (),
     )
@@ -51,8 +44,7 @@ async fn test_bank_account_aggregate() -> Result<(), anyhow::Error> {
     // Test insufficient funds
     let withdraw_too_much = BankAccountCommand::withdraw_funds(1000, stream_id.clone());
     
-    let result = ask_cqrs::execute_command::<BankAccountAggregate>(
-        client.clone(),
+    let result = store.execute_command::<BankAccountAggregate>(
         withdraw_too_much,
         (),
     )
@@ -70,15 +62,14 @@ async fn test_bank_account_aggregate() -> Result<(), anyhow::Error> {
 #[instrument]
 async fn test_bank_account_duplicate_open() -> Result<(), anyhow::Error> {
     initialize_logger();
-    let client = create_es_client();
+    let store = create_test_store().await?;
     
     // First open command
     let account_id = Uuid::new_v4().to_string();
     let open_command = BankAccountCommand::open_account("user1".to_string())
         .with_account_id(account_id.clone());
 
-    execute_command::<BankAccountAggregate>(
-        client.clone(),
+    store.execute_command::<BankAccountAggregate>(
         open_command,
         (),
     )
@@ -88,8 +79,7 @@ async fn test_bank_account_duplicate_open() -> Result<(), anyhow::Error> {
     let duplicate_open = BankAccountCommand::open_account("user1".to_string())
         .with_account_id(account_id);
 
-    let result = execute_command::<BankAccountAggregate>(
-        client,
+    let result = store.execute_command::<BankAccountAggregate>(
         duplicate_open,
         (),
     )
@@ -107,14 +97,13 @@ async fn test_bank_account_duplicate_open() -> Result<(), anyhow::Error> {
 #[instrument]
 async fn test_bank_account_nonexistent() -> Result<(), anyhow::Error> {
     initialize_logger();
-    let client = create_es_client();
+    let store = create_test_store().await?;
     
     // Try to deposit to nonexistent account
     let account_id = Uuid::new_v4().to_string();
     let command = BankAccountCommand::withdraw_funds(100, account_id);
     
-    let result = execute_command::<BankAccountAggregate>(
-        client,
+    let result = store.execute_command::<BankAccountAggregate>(
         command,
         (),
     )

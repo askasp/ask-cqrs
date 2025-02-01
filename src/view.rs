@@ -1,96 +1,58 @@
 use std::sync::Arc;
 use dashmap::DashMap;
 use serde::{de::DeserializeOwned, Serialize};
-use eventstore::RecordedEvent;
+use tokio_postgres::Client;
+use anyhow::Result;
+use std::sync::atomic::{AtomicI64, Ordering};
+use tokio_postgres::Row;
 use uuid::Uuid;
+use deadpool_postgres::Pool;
+use std::sync::RwLock;
 
 /// Trait for implementing a read model/view
-pub trait View: Send + Sync + 'static {
-    /// The state type for a single entity in the view
-    type State: Clone + Send + Sync + 'static + DeserializeOwned + Serialize;
+pub trait View: Clone + Send + Sync + 'static + DeserializeOwned + Serialize {
     /// The event type this view processes
     type Event: Clone + Send + Sync + 'static + DeserializeOwned + Serialize + std::fmt::Debug;
 
     /// Name of the view, used for logging and debugging
-    fn name() -> &'static str;
+    fn name() -> String;
     
-    /// Extract the view entity ID from an event, if this event is relevant
+    /// Optional snapshot configuration - how many events before taking a snapshot
+    fn snapshot_frequency() -> Option<u32> {
+        None // By default, no snapshots
+    }
+
+    /// Optional event filtering - which event types to process
+    fn event_types() -> Vec<String> {
+        vec![] // Empty means all events
+    }
+}
+
+/// Trait for views that maintain state for individual entities
+pub trait StateView: View {
+    /// Extract the entity ID from an event, if this event is relevant
     fn entity_id_from_event(event: &Self::Event) -> Option<String>;
     
-    /// Initialize a new state when first relevant event is received
-    fn initialize_state(event: &Self::Event, stream_id: &str, recorded_event: &RecordedEvent) -> Option<Self::State>;
+    /// Initialize a new view when first relevant event is received
+    fn initialize(event: &Self::Event) -> Option<Self>;
     
-    /// Update existing state with an event
-    fn update_state(state: &mut Self::State, event: &Self::Event, stream_id: &str, recorded_event: &RecordedEvent);
+    /// Update view with an event
+    fn apply_event(&mut self, event: &Self::Event);
 }
 
-/// A thread-safe view store that can be shared across the application
-pub struct ViewStore<V: View> {
-    states: Arc<DashMap<String, V::State>>,
-    handled_events: Arc<DashMap<Uuid, ()>>,
-}
+/// Trait for views that maintain an index across multiple streams
+pub trait IndexView: View {
+    /// The index state type
+    type Index: Clone + Send + Sync + 'static + DeserializeOwned + Serialize + Default;
 
-impl<V: View> ViewStore<V> {
-    pub fn new() -> Self {
-        Self {
-            states: Arc::new(DashMap::new()),
-            handled_events: Arc::new(DashMap::new()),
-        }
+    /// Query the index with the given criteria
+    fn query(&self, index: &Self::Index, criteria: &str) -> Vec<String>;
+    
+    /// Initialize a new index
+    fn initialize_index() -> Self::Index {
+        Self::Index::default()
     }
-
-    /// Get a single entity by ID
-    pub fn get(&self, id: &str) -> Option<V::State> {
-        self.states.get(id).map(|v| v.clone())
-    }
-
-    /// Get all entities that match a predicate
-    pub fn find<F>(&self, predicate: F) -> Vec<V::State> 
-    where 
-        F: Fn(&V::State) -> bool 
-    {
-        self.states
-            .iter()
-            .filter(|r| predicate(r.value()))
-            .map(|r| r.value().clone())
-            .collect()
-    }
-
-    /// Handle an incoming event
-    pub fn handle_event(
-        &self,
-        event: &V::Event,
-        stream_id: &str,
-        recorded_event: &RecordedEvent,
-    ) {
-        tracing::info!("Handling event: {:?}", event);
-        
-        // Check if we've already handled this event
-        if self.handled_events.contains_key(&recorded_event.id) {
-            tracing::debug!(
-                "Ignoring already handled event: {}",
-                recorded_event.id
-            );
-            return;
-        }
-
-        if let Some(entity_id) = V::entity_id_from_event(event) {
-            tracing::info!("Entity ID: {:?}", entity_id);
-
-            match self.states.get_mut(&entity_id) {
-                Some(mut entry) => {
-                    tracing::info!("Updating state");
-                    V::update_state(&mut entry, event, stream_id, recorded_event);
-                }
-                None => {
-                    if let Some(new_state) = V::initialize_state(event, stream_id, recorded_event) {
-                        tracing::info!("Inserting new state");
-                        self.states.insert(entity_id.clone(), new_state);
-                    }
-                }
-            }
-            
-            // Mark this event as handled
-            self.handled_events.insert(recorded_event.id, ());
-        }
-    }
+    
+    /// Update index with an event
+    fn update_index(&self, index: &mut Self::Index, event: &Self::Event);
 }
