@@ -15,37 +15,41 @@ async fn test_bank_account_aggregate() -> Result<(), anyhow::Error> {
     
     // Test opening an account
     let user_id = Uuid::new_v4().to_string();
-    let open_command = BankAccountCommand::open_account(user_id.clone());
-    
     let stream_id = store.execute_command::<BankAccountAggregate>(
-        open_command,
+        BankAccountCommand::OpenAccount { 
+            user_id: user_id.clone(),
+            account_id: None,
+        },
         (),
     )
     .await?;
 
     // Test depositing funds
-    let deposit_command = BankAccountCommand::deposit_funds(100, stream_id.clone());
-    
     store.execute_command::<BankAccountAggregate>(
-        deposit_command,
+        BankAccountCommand::DepositFunds { 
+            amount: 100,
+            account_id: stream_id.clone(),
+        },
         (),
     )
     .await?;
 
     // Test withdrawing funds successfully
-    let withdraw_command = BankAccountCommand::withdraw_funds(50, stream_id.clone());
-    
     store.execute_command::<BankAccountAggregate>(
-        withdraw_command,
+        BankAccountCommand::WithdrawFunds { 
+            amount: 50,
+            account_id: stream_id.clone(),
+        },
         (),
     )
     .await?;
 
     // Test insufficient funds
-    let withdraw_too_much = BankAccountCommand::withdraw_funds(1000, stream_id.clone());
-    
     let result = store.execute_command::<BankAccountAggregate>(
-        withdraw_too_much,
+        BankAccountCommand::WithdrawFunds { 
+            amount: 1000,
+            account_id: stream_id.clone(),
+        },
         (),
     )
     .await;
@@ -66,21 +70,21 @@ async fn test_bank_account_duplicate_open() -> Result<(), anyhow::Error> {
     
     // First open command
     let account_id = Uuid::new_v4().to_string();
-    let open_command = BankAccountCommand::open_account("user1".to_string())
-        .with_account_id(account_id.clone());
-
     store.execute_command::<BankAccountAggregate>(
-        open_command,
+        BankAccountCommand::OpenAccount { 
+            user_id: "user1".to_string(),
+            account_id: Some(account_id.clone()),
+        },
         (),
     )
     .await?;
 
     // Second open command with same account ID
-    let duplicate_open = BankAccountCommand::open_account("user1".to_string())
-        .with_account_id(account_id);
-
     let result = store.execute_command::<BankAccountAggregate>(
-        duplicate_open,
+        BankAccountCommand::OpenAccount { 
+            user_id: "user1".to_string(),
+            account_id: Some(account_id),
+        },
         (),
     )
     .await;
@@ -101,10 +105,11 @@ async fn test_bank_account_nonexistent() -> Result<(), anyhow::Error> {
     
     // Try to deposit to nonexistent account
     let account_id = Uuid::new_v4().to_string();
-    let command = BankAccountCommand::withdraw_funds(100, account_id);
-    
     let result = store.execute_command::<BankAccountAggregate>(
-        command,
+        BankAccountCommand::WithdrawFunds { 
+            amount: 100,
+            account_id,
+        },
         (),
     )
     .await;

@@ -25,25 +25,31 @@ async fn test_fraud_detection_handler() -> Result<(), anyhow::Error> {
     let user_id = Uuid::new_v4().to_string();
 
     // Open account
-    let open_command = BankAccountCommand::open_account(user_id);
     let account_id = store.execute_command::<BankAccountAggregate>(
-        open_command,
+        BankAccountCommand::OpenAccount { 
+            user_id,
+            account_id: None,
+        },
         (),
     )
     .await?;
 
     // Deposit 5000 to ensure we have enough funds
-    let deposit_command = BankAccountCommand::deposit_funds(5000, account_id.clone());
     store.execute_command::<BankAccountAggregate>(
-        deposit_command,
+        BankAccountCommand::DepositFunds { 
+            amount: 5000,
+            account_id: account_id.clone(),
+        },
         (),
     )
     .await?;
 
     // First withdrawal of 2000 should succeed
-    let withdraw_command = BankAccountCommand::withdraw_funds(2000, account_id.clone());
     store.execute_command::<BankAccountAggregate>(
-        withdraw_command,
+        BankAccountCommand::WithdrawFunds { 
+            amount: 2000,
+            account_id: account_id.clone(),
+        },
         (),
     )
     .await?;
@@ -52,9 +58,11 @@ async fn test_fraud_detection_handler() -> Result<(), anyhow::Error> {
     sleep(Duration::from_millis(2000)).await;
 
     // Second withdrawal should fail because account is suspended
-    let withdraw_command = BankAccountCommand::withdraw_funds(100, account_id.clone());
     let result = store.execute_command::<BankAccountAggregate>(
-        withdraw_command,
+        BankAccountCommand::WithdrawFunds { 
+            amount: 100,
+            account_id: account_id.clone(),
+        },
         (),
     )
     .await;
@@ -70,7 +78,6 @@ async fn test_fraud_detection_handler() -> Result<(), anyhow::Error> {
 
     Ok(())
 }
-// // 
 
 #[instrument]
 async fn test_fraud_detection_handler_small_withdrawals() -> Result<(), anyhow::Error> {
@@ -85,26 +92,32 @@ async fn test_fraud_detection_handler_small_withdrawals() -> Result<(), anyhow::
     let user_id = Uuid::new_v4().to_string();
 
     // Open account
-    let open_command = BankAccountCommand::open_account(user_id);
     let account_id = store.execute_command::<BankAccountAggregate>(
-        open_command,
+        BankAccountCommand::OpenAccount { 
+            user_id,
+            account_id: None,
+        },
         (),
     )
     .await?;
 
     // Deposit 3000 to ensure we have enough funds
-    let deposit_command = BankAccountCommand::deposit_funds(3000, account_id.clone());
     store.execute_command::<BankAccountAggregate>(
-        deposit_command,
+        BankAccountCommand::DepositFunds { 
+            amount: 3000,
+            account_id: account_id.clone(),
+        },
         (),
     )
     .await?;
 
     // Multiple small withdrawals should succeed
     for _ in 0..3 {
-        let withdraw_command = BankAccountCommand::withdraw_funds(500, account_id.clone());
         store.execute_command::<BankAccountAggregate>(
-            withdraw_command,
+            BankAccountCommand::WithdrawFunds { 
+                amount: 500,
+                account_id: account_id.clone(),
+            },
             (),
         )
         .await?;

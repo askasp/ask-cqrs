@@ -1,4 +1,4 @@
-use ask_cqrs::view::{StateView, View, IndexView};
+use ask_cqrs::view::{StreamView, View, GlobalView};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use super::bank_account::BankAccountEvent;
@@ -17,7 +17,7 @@ impl View for BankAccountView {
     }
 }
 
-impl StateView for BankAccountView {
+impl StreamView for BankAccountView {
     fn entity_id_from_event(event: &Self::Event) -> Option<String> {
         Some(event.account_id())
     }
@@ -62,19 +62,19 @@ impl View for UserAccountsIndexView {
     }
 }
 
-impl IndexView for UserAccountsIndexView {
-    type Index = UserAccountsIndex;
+impl GlobalView for UserAccountsIndexView {
+    type State = UserAccountsIndex;
 
-    fn query(&self, index: &Self::Index, criteria: &str) -> Vec<String> {
-        index.accounts_by_user.get(criteria)
+    fn query(&self, state: &Self::State, criteria: &str) -> Vec<String> {
+        state.accounts_by_user.get(criteria)
             .cloned()
             .unwrap_or_default()
     }
 
-    fn update_index(&self, index: &mut Self::Index, event: &Self::Event) {
+    fn update_state(&self, state: &mut Self::State, event: &Self::Event) {
         match event {
             BankAccountEvent::AccountOpened { user_id, account_id } => {
-                index.accounts_by_user
+                state.accounts_by_user
                     .entry(user_id.clone())
                     .or_default()
                     .push(account_id.clone());

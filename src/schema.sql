@@ -1,7 +1,8 @@
 -- Events table for storing all domain events
 CREATE TABLE IF NOT EXISTS events (
     id TEXT PRIMARY KEY,
-    stream_id TEXT NOT NULL,  -- Format: "aggregate_type-entity_id"
+    stream_name TEXT NOT NULL,
+    stream_id TEXT NOT NULL,
     event_data JSONB NOT NULL,
     stream_position BIGINT NOT NULL,
     global_position BIGSERIAL,
@@ -11,7 +12,8 @@ CREATE TABLE IF NOT EXISTS events (
 
 -- Indexes for efficient querying
 CREATE INDEX IF NOT EXISTS idx_events_global_position ON events(global_position);
-CREATE INDEX IF NOT EXISTS idx_events_stream ON events(stream_id, stream_position);
+CREATE INDEX IF NOT EXISTS idx_events_stream ON events(stream_name);
+CREATE INDEX IF NOT EXISTS idx_events_stream_id ON events(stream_id);
 
 -- Persistent subscriptions for tracking event processing progress
 CREATE TABLE IF NOT EXISTS persistent_subscriptions (

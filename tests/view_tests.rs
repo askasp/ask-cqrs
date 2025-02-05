@@ -7,9 +7,10 @@ use uuid::Uuid;
 mod common;
 mod test_utils;
 
-use ask_cqrs::view::IndexView;
+use ask_cqrs::view::GlobalView;
 use common::bank_account::{BankAccountAggregate, BankAccountCommand};
 use common::bank_account_view::{BankAccountView, UserAccountsIndexView};
+use common::bank_liquidity_view::BankLiquidityView;
 use test_utils::{initialize_logger, create_test_store};
 
 #[tokio::test]
@@ -22,20 +23,22 @@ async fn test_bank_account_view_async() -> Result<(), anyhow::Error> {
     let user_id = Uuid::new_v4().to_string();
 
     // Open account
-    let open_command = BankAccountCommand::open_account(user_id.clone());
     let account_id = store.execute_command::<BankAccountAggregate>(
-        open_command,
+        BankAccountCommand::OpenAccount { 
+            user_id: user_id.clone(),
+            account_id: None,
+        },
         (),
-    )
-    .await?;
+    ).await?;
 
     // Deposit funds
-    let deposit_command = BankAccountCommand::deposit_funds(100, account_id.clone());
     store.execute_command::<BankAccountAggregate>(
-        deposit_command,
+        BankAccountCommand::DepositFunds { 
+            amount: 100,
+            account_id: account_id.clone(),
+        },
         (),
-    )
-    .await?;
+    ).await?;
 
     // Get view state
     let view = store.get_view_state::<BankAccountView>(&account_id).await?
@@ -57,35 +60,39 @@ async fn test_bank_account_view_multiple() -> Result<(), anyhow::Error> {
     let user_id = Uuid::new_v4().to_string();
 
     // Open first account
-    let open_command1 = BankAccountCommand::open_account(user_id.clone());
     let account_id1 = store.execute_command::<BankAccountAggregate>(
-        open_command1,
+        BankAccountCommand::OpenAccount { 
+            user_id: user_id.clone(),
+            account_id: None,
+        },
         (),
-    )
-    .await?;
+    ).await?;
 
     // Open second account
-    let open_command2 = BankAccountCommand::open_account(user_id.clone());
     let account_id2 = store.execute_command::<BankAccountAggregate>(
-        open_command2,
+        BankAccountCommand::OpenAccount { 
+            user_id: user_id.clone(),
+            account_id: None,
+        },
         (),
-    )
-    .await?;
+    ).await?;
 
     // Deposit different amounts
-    let deposit_command1 = BankAccountCommand::deposit_funds(100, account_id1.clone());
     store.execute_command::<BankAccountAggregate>(
-        deposit_command1,
+        BankAccountCommand::DepositFunds { 
+            amount: 100,
+            account_id: account_id1.clone(),
+        },
         (),
-    )
-    .await?;
+    ).await?;
 
-    let deposit_command2 = BankAccountCommand::deposit_funds(200, account_id2.clone());
     store.execute_command::<BankAccountAggregate>(
-        deposit_command2,
+        BankAccountCommand::DepositFunds { 
+            amount: 200,
+            account_id: account_id2.clone(),
+        },
         (),
-    )
-    .await?;
+    ).await?;
 
     // Get and verify first account
     let view1 = store.get_view_state::<BankAccountView>(&account_id1).await?
@@ -113,31 +120,34 @@ async fn test_user_accounts_index() -> Result<(), anyhow::Error> {
     let user_id2 = Uuid::new_v4().to_string();
 
     // Create two accounts for first user
-    let open_command1 = BankAccountCommand::open_account(user_id1.clone());
     let account_id1 = store.execute_command::<BankAccountAggregate>(
-        open_command1,
+        BankAccountCommand::OpenAccount { 
+            user_id: user_id1.clone(),
+            account_id: None,
+        },
         (),
-    )
-    .await?;
+    ).await?;
 
-    let open_command2 = BankAccountCommand::open_account(user_id1.clone());
     let account_id2 = store.execute_command::<BankAccountAggregate>(
-        open_command2,
+        BankAccountCommand::OpenAccount { 
+            user_id: user_id1.clone(),
+            account_id: None,
+        },
         (),
-    )
-    .await?;
+    ).await?;
 
     // Create one account for second user
-    let open_command3 = BankAccountCommand::open_account(user_id2.clone());
     let account_id3 = store.execute_command::<BankAccountAggregate>(
-        open_command3,
+        BankAccountCommand::OpenAccount { 
+            user_id: user_id2.clone(),
+            account_id: None,
+        },
         (),
-    )
-    .await?;
+    ).await?;
 
     // Get the index state
     let index_view = UserAccountsIndexView;
-    let index = store.get_index_state::<UserAccountsIndexView>().await?;
+    let index = store.get_global_state::<UserAccountsIndexView>().await?;
 
     // Query accounts for first user
     let user1_accounts = index_view.query(&index, &user_id1);
@@ -173,20 +183,22 @@ async fn test_batch_view_loading() -> Result<(), anyhow::Error> {
 
     for amount in amounts {
         // Open account
-        let open_command = BankAccountCommand::open_account(user_id.clone());
         let account_id = store.execute_command::<BankAccountAggregate>(
-            open_command,
+            BankAccountCommand::OpenAccount { 
+                user_id: user_id.clone(),
+                account_id: None,
+            },
             (),
-        )
-        .await?;
+        ).await?;
 
         // Deposit funds
-        let deposit_command = BankAccountCommand::deposit_funds(amount, account_id.clone());
         store.execute_command::<BankAccountAggregate>(
-            deposit_command,
+            BankAccountCommand::DepositFunds { 
+                amount,
+                account_id: account_id.clone(),
+            },
             (),
-        )
-        .await?;
+        ).await?;
 
         account_ids.push(account_id);
     }
@@ -201,6 +213,79 @@ async fn test_batch_view_loading() -> Result<(), anyhow::Error> {
         assert_eq!(view.balance, amounts[i] as u64);
         assert_eq!(view.user_id, user_id);
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_bank_liquidity_view() -> Result<(), anyhow::Error> {
+    let store = create_test_store().await?;
+    
+    // Create a few accounts and perform transactions
+    let account_id1 = store.execute_command::<BankAccountAggregate>(
+        BankAccountCommand::OpenAccount { 
+            user_id: "user1".to_string(),
+            account_id: None,
+        },
+        (),
+    ).await?;
+
+    let account_id2 = store.execute_command::<BankAccountAggregate>(
+        BankAccountCommand::OpenAccount { 
+            user_id: "user2".to_string(),
+            account_id: None,
+        },
+        (),
+    ).await?;
+
+    // Deposit funds
+    store.execute_command::<BankAccountAggregate>(
+        BankAccountCommand::DepositFunds { 
+            amount: 1000,
+            account_id: account_id1.clone(),
+        },
+        (),
+    ).await?;
+
+    store.execute_command::<BankAccountAggregate>(
+        BankAccountCommand::DepositFunds { 
+            amount: 500,
+            account_id: account_id2.clone(),
+        },
+        (),
+    ).await?;
+
+    // Withdraw some funds
+    store.execute_command::<BankAccountAggregate>(
+        BankAccountCommand::WithdrawFunds { 
+            amount: 300,
+            account_id: account_id1.clone(),
+        },
+        (),
+    ).await?;
+
+    // Get the liquidity view
+    let liquidity = store.get_global_state::<BankLiquidityView>().await?;
+
+    // Check the results - we expect at least 2 accounts since we created them in this test
+    assert!(liquidity.total_accounts >= 2, "Expected at least 2 accounts, got {}", liquidity.total_accounts);
+    assert!(liquidity.total_balance >= 1200, "Expected at least 1200 balance, got {}", liquidity.total_balance); // 1000 + 500 - 300 = 1200
+
+    // Test snapshot functionality
+    store.save_global_snapshot::<BankLiquidityView>(&liquidity).await?;
+
+    // Make another transaction
+    store.execute_command::<BankAccountAggregate>(
+        BankAccountCommand::DepositFunds { 
+            amount: 800,
+            account_id: account_id2.clone(),
+        },
+        (),
+    ).await?;
+
+    // Get the view again, should load from snapshot and apply new events
+    let liquidity = store.get_global_state::<BankLiquidityView>().await?;
+    assert!(liquidity.total_balance >= 2000, "Expected at least 2000 balance, got {}", liquidity.total_balance); // 1200 + 800 = 2000
 
     Ok(())
 } 

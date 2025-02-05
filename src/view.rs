@@ -1,13 +1,4 @@
-use std::sync::Arc;
-use dashmap::DashMap;
 use serde::{de::DeserializeOwned, Serialize};
-use tokio_postgres::Client;
-use anyhow::Result;
-use std::sync::atomic::{AtomicI64, Ordering};
-use tokio_postgres::Row;
-use uuid::Uuid;
-use deadpool_postgres::Pool;
-use std::sync::RwLock;
 
 /// Trait for implementing a read model/view
 pub trait View: Clone + Send + Sync + 'static + DeserializeOwned + Serialize {
@@ -28,8 +19,8 @@ pub trait View: Clone + Send + Sync + 'static + DeserializeOwned + Serialize {
     }
 }
 
-/// Trait for views that maintain state for individual entities
-pub trait StateView: View {
+/// Trait for views that maintain state for individual streams
+pub trait StreamView: View {
     /// Extract the entity ID from an event, if this event is relevant
     fn entity_id_from_event(event: &Self::Event) -> Option<String>;
     
@@ -40,19 +31,19 @@ pub trait StateView: View {
     fn apply_event(&mut self, event: &Self::Event);
 }
 
-/// Trait for views that maintain an index across multiple streams
-pub trait IndexView: View {
-    /// The index state type
-    type Index: Clone + Send + Sync + 'static + DeserializeOwned + Serialize + Default;
+/// Trait for views that maintain state across all streams
+pub trait GlobalView: View {
+    /// The global state type
+    type State: Clone + Send + Sync + 'static + DeserializeOwned + Serialize + Default;
 
-    /// Query the index with the given criteria
-    fn query(&self, index: &Self::Index, criteria: &str) -> Vec<String>;
+    /// Query the state with the given criteria
+    fn query(&self, state: &Self::State, criteria: &str) -> Vec<String>;
     
-    /// Initialize a new index
-    fn initialize_index() -> Self::Index {
-        Self::Index::default()
+    /// Initialize a new state
+    fn initialize_state() -> Self::State {
+        Self::State::default()
     }
     
-    /// Update index with an event
-    fn update_index(&self, index: &mut Self::Index, event: &Self::Event);
+    /// Update state with an event
+    fn update_state(&self, state: &mut Self::State, event: &Self::Event);
 }

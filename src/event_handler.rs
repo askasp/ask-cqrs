@@ -1,6 +1,5 @@
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
-use tokio_postgres::Row;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -21,6 +20,5 @@ pub trait EventHandler: Send + Sync + 'static {
     async fn handle_event(
         &self,
         event: Self::Events,
-        row: &Row,
     ) -> Result<(), EventHandlerError>;
 }
