@@ -465,6 +465,7 @@ impl PostgresStore {
         // For any stream_ids not found in snapshots, rebuild from events
         let missing_ids: Vec<_> = stream_ids.iter()
             .filter(|id| !views.contains_key(*id))
+            .map(|s| s.to_string())
             .collect();
 
         if !missing_ids.is_empty() {
