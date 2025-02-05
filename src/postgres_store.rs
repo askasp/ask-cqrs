@@ -101,16 +101,16 @@ impl PostgresStore {
         &self,
         stream_id: &str,
     ) -> Result<(Option<A::State>, Option<i64>), anyhow::Error> {
-        let stream_name = format!("{}-{}-{}", "ask_cqrs", A::name(), stream_id);
+        let stream_id = format!("{}-{}", A::name(), stream_id);
         
         // Get all events for this stream
         let client = self.get_client().await?;
         let rows = client
             .query(
                 "SELECT event_data, stream_position FROM events 
-                 WHERE stream_name = $1 
+                 WHERE stream_id = $1 
                  ORDER BY stream_position",
-                &[&stream_name],
+                &[&stream_id],
             )
             .await?;
 
@@ -141,13 +141,13 @@ impl PostgresStore {
     where
         A::Command: DomainCommand,
     {
-        let stream_id = command.stream_id();
-        tracing::info!("Executing command {:?}", stream_id);
+        let entity_id = command.stream_id();
+        tracing::info!("Executing command {:?}", entity_id);
         
-        let (state, last_position) = self.build_state::<A>(&stream_id).await?;
-        let events = A::execute(&state, &command, &stream_id, service)?;
+        let (state, last_position) = self.build_state::<A>(&entity_id).await?;
+        let events = A::execute(&state, &command, &entity_id, service)?;
 
-        let stream_name = format!("{}-{}-{}", "ask_cqrs", A::name(), stream_id);
+        let stream_id = format!("{}-{}", A::name(), entity_id);
         let next_position = last_position.unwrap_or(-1) + 1;
 
         // Get a client and start a transaction
@@ -160,11 +160,10 @@ impl PostgresStore {
             let id = Uuid::new_v4().to_string();
 
             tx.execute(
-                "INSERT INTO events (id, stream_name, stream_id, event_data, stream_position) 
-                 VALUES ($1, $2, $3, $4::jsonb, $5)",
+                "INSERT INTO events (id, stream_id, event_data, stream_position) 
+                 VALUES ($1, $2, $3::jsonb, $4)",
                 &[
                     &id,
-                    &stream_name,
                     &stream_id,
                     &event_json,
                     &stream_position,
@@ -173,7 +172,7 @@ impl PostgresStore {
         }
 
         tx.commit().await?;
-        Ok(stream_id)
+        Ok(entity_id)
     }
 
 
@@ -325,10 +324,10 @@ impl PostgresStore {
                 let rows = client
                     .query(
                         "SELECT event_data FROM events 
-                         WHERE stream_id = $1 
+                         WHERE stream_id LIKE $1 
                          AND global_position > $2
                          ORDER BY global_position",
-                        &[&stream_id, &last_position],
+                        &[&format!("%-{}", stream_id), &last_position],
                     )
                     .await?;
 
@@ -346,9 +345,9 @@ impl PostgresStore {
         let rows = client
             .query(
                 "SELECT event_data FROM events 
-                 WHERE stream_id = $1 
+                 WHERE stream_id LIKE $1 
                  ORDER BY global_position",
-                &[&stream_id],
+                &[&format!("%-{}", stream_id)],
             )
             .await?;
 
@@ -517,18 +516,22 @@ impl PostgresStore {
 
             // Get all events after the snapshots
             if !views.is_empty() {
+                let like_patterns: Vec<String> = stream_ids.iter()
+                    .map(|id| format!("%-{}", id))
+                    .collect();
+
                 let rows = client
                     .query(
                         "SELECT stream_id, event_data FROM events 
-                         WHERE stream_id = ANY($1) 
+                         WHERE stream_id LIKE ANY($1) 
                          AND global_position > (
                              SELECT COALESCE(MAX(last_event_position), -1)
                              FROM view_snapshots 
                              WHERE view_name = $2 
-                             AND stream_id = ANY($1)
+                             AND stream_id = ANY($3)
                          )
                          ORDER BY global_position",
-                        &[&stream_ids, &V::name()],
+                        &[&like_patterns, &V::name(), &stream_ids],
                     )
                     .await?;
 
@@ -548,12 +551,16 @@ impl PostgresStore {
             .collect();
 
         if !missing_ids.is_empty() {
+            let like_patterns: Vec<String> = missing_ids.iter()
+                .map(|id| format!("%-{}", id))
+                .collect();
+
             let rows = client
                 .query(
                     "SELECT stream_id, event_data FROM events 
-                     WHERE stream_id = ANY($1) 
+                     WHERE stream_id LIKE ANY($1) 
                      ORDER BY global_position",
-                    &[&missing_ids],
+                    &[&like_patterns],
                 )
                 .await?;
 
