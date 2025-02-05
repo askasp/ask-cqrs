@@ -1,6 +1,7 @@
 use ask_cqrs::view::{View, GlobalView};
 use serde::{Deserialize, Serialize};
 use super::bank_account::BankAccountEvent;
+use ask_cqrs::event_handler::EventRow;
 
 // Bank liquidity tracking across all accounts
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -33,7 +34,7 @@ impl GlobalView for BankLiquidityView {
         Vec::new()
     }
 
-    fn update_state(&self, state: &mut Self::State, event: &Self::Event) {
+    fn update_state(&self, state: &mut Self::State, event: &Self::Event, _event_row: &EventRow) {
         match event {
             BankAccountEvent::AccountOpened { .. } => {
                 state.total_accounts += 1;

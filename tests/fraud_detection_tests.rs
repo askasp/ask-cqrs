@@ -3,6 +3,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 use tracing::instrument;
 use uuid::Uuid;
+use serde_json::json;
 
 mod common;
 mod test_utils;
@@ -27,10 +28,11 @@ async fn test_fraud_detection_handler() -> Result<(), anyhow::Error> {
     // Open account
     let account_id = store.execute_command::<BankAccountAggregate>(
         BankAccountCommand::OpenAccount { 
-            user_id,
+            user_id: user_id.clone(),
             account_id: None,
         },
         (),
+        json!({"user_id": user_id}),
     )
     .await?;
 
@@ -41,6 +43,7 @@ async fn test_fraud_detection_handler() -> Result<(), anyhow::Error> {
             account_id: account_id.clone(),
         },
         (),
+        json!({"user_id": user_id}),
     )
     .await?;
 
@@ -51,6 +54,7 @@ async fn test_fraud_detection_handler() -> Result<(), anyhow::Error> {
             account_id: account_id.clone(),
         },
         (),
+        json!({"user_id": user_id}),
     )
     .await?;
 
@@ -64,6 +68,7 @@ async fn test_fraud_detection_handler() -> Result<(), anyhow::Error> {
             account_id: account_id.clone(),
         },
         (),
+        json!({"user_id": user_id}),
     )
     .await;
 
@@ -94,10 +99,11 @@ async fn test_fraud_detection_handler_small_withdrawals() -> Result<(), anyhow::
     // Open account
     let account_id = store.execute_command::<BankAccountAggregate>(
         BankAccountCommand::OpenAccount { 
-            user_id,
+            user_id: user_id.clone(),
             account_id: None,
         },
         (),
+        json!({"user_id": user_id}),
     )
     .await?;
 
@@ -108,6 +114,7 @@ async fn test_fraud_detection_handler_small_withdrawals() -> Result<(), anyhow::
             account_id: account_id.clone(),
         },
         (),
+        json!({"user_id": user_id}),
     )
     .await?;
 
@@ -119,6 +126,7 @@ async fn test_fraud_detection_handler_small_withdrawals() -> Result<(), anyhow::
                 account_id: account_id.clone(),
             },
             (),
+            json!({"user_id": user_id}),
         )
         .await?;
 

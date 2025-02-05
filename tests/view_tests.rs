@@ -3,6 +3,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 use tracing::instrument;
 use uuid::Uuid;
+use serde_json::json;
 
 mod common;
 mod test_utils;
@@ -29,6 +30,7 @@ async fn test_bank_account_view_async() -> Result<(), anyhow::Error> {
             account_id: None,
         },
         (),
+        json!({"user_id": user_id}),
     ).await?;
 
     // Deposit funds
@@ -38,6 +40,7 @@ async fn test_bank_account_view_async() -> Result<(), anyhow::Error> {
             account_id: account_id.clone(),
         },
         (),
+        json!({"user_id": user_id}),
     ).await?;
 
     // Get view state
@@ -66,6 +69,7 @@ async fn test_bank_account_view_multiple() -> Result<(), anyhow::Error> {
             account_id: None,
         },
         (),
+        json!({"user_id": user_id}),
     ).await?;
 
     // Open second account
@@ -75,6 +79,7 @@ async fn test_bank_account_view_multiple() -> Result<(), anyhow::Error> {
             account_id: None,
         },
         (),
+        json!({"user_id": user_id}),
     ).await?;
 
     // Deposit different amounts
@@ -84,6 +89,7 @@ async fn test_bank_account_view_multiple() -> Result<(), anyhow::Error> {
             account_id: account_id1.clone(),
         },
         (),
+        json!({"user_id": user_id}),
     ).await?;
 
     store.execute_command::<BankAccountAggregate>(
@@ -92,6 +98,7 @@ async fn test_bank_account_view_multiple() -> Result<(), anyhow::Error> {
             account_id: account_id2.clone(),
         },
         (),
+        json!({"user_id": user_id}),
     ).await?;
 
     // Get and verify first account
@@ -126,6 +133,7 @@ async fn test_user_accounts_index() -> Result<(), anyhow::Error> {
             account_id: None,
         },
         (),
+        json!({"user_id": user_id1}),
     ).await?;
 
     let account_id2 = store.execute_command::<BankAccountAggregate>(
@@ -134,6 +142,7 @@ async fn test_user_accounts_index() -> Result<(), anyhow::Error> {
             account_id: None,
         },
         (),
+        json!({"user_id": user_id1}),
     ).await?;
 
     // Create one account for second user
@@ -143,6 +152,7 @@ async fn test_user_accounts_index() -> Result<(), anyhow::Error> {
             account_id: None,
         },
         (),
+        json!({"user_id": user_id2}),
     ).await?;
 
     // Get the index state
@@ -189,6 +199,7 @@ async fn test_batch_view_loading() -> Result<(), anyhow::Error> {
                 account_id: None,
             },
             (),
+            json!({"user_id": user_id}),
         ).await?;
 
         // Deposit funds
@@ -198,6 +209,7 @@ async fn test_batch_view_loading() -> Result<(), anyhow::Error> {
                 account_id: account_id.clone(),
             },
             (),
+            json!({"user_id": user_id}),
         ).await?;
 
         account_ids.push(account_id);
@@ -228,6 +240,7 @@ async fn test_bank_liquidity_view() -> Result<(), anyhow::Error> {
             account_id: None,
         },
         (),
+        json!({"user_id": "user1"}),
     ).await?;
 
     let account_id2 = store.execute_command::<BankAccountAggregate>(
@@ -236,6 +249,7 @@ async fn test_bank_liquidity_view() -> Result<(), anyhow::Error> {
             account_id: None,
         },
         (),
+        json!({"user_id": "user2"}),
     ).await?;
 
     // Deposit funds
@@ -245,6 +259,7 @@ async fn test_bank_liquidity_view() -> Result<(), anyhow::Error> {
             account_id: account_id1.clone(),
         },
         (),
+        json!({"user_id": "user1"}),
     ).await?;
 
     store.execute_command::<BankAccountAggregate>(
@@ -253,6 +268,7 @@ async fn test_bank_liquidity_view() -> Result<(), anyhow::Error> {
             account_id: account_id2.clone(),
         },
         (),
+        json!({"user_id": "user2"}),
     ).await?;
 
     // Withdraw some funds
@@ -262,6 +278,7 @@ async fn test_bank_liquidity_view() -> Result<(), anyhow::Error> {
             account_id: account_id1.clone(),
         },
         (),
+        json!({"user_id": "user1"}),
     ).await?;
 
     // Get the liquidity view
@@ -281,6 +298,7 @@ async fn test_bank_liquidity_view() -> Result<(), anyhow::Error> {
             account_id: account_id2.clone(),
         },
         (),
+        json!({"user_id": "user2"}),
     ).await?;
 
     // Get the view again, should load from snapshot and apply new events

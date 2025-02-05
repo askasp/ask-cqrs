@@ -4,6 +4,7 @@ CREATE TABLE IF NOT EXISTS events (
     stream_name TEXT NOT NULL,
     stream_id TEXT NOT NULL,
     event_data JSONB NOT NULL,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
     stream_position BIGINT NOT NULL,
     global_position BIGSERIAL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,

@@ -6,6 +6,7 @@ use tracing::instrument;
 use tokio::sync::broadcast;
 use serde_json::{self, Value as JsonValue};
 use std::collections::HashMap;
+use crate::event_handler::EventRow;
 
 use crate::{
     aggregate::Aggregate,
@@ -77,11 +78,12 @@ impl PostgresStore {
     }
 
     /// Execute a command and store the resulting events
-    #[instrument(skip(self, command, service))]
+    #[instrument(skip(self, command, service, metadata))]
     pub async fn execute_command<A: Aggregate>(
         &self,
         command: A::Command,
         service: A::Service,
+        metadata: JsonValue,
     ) -> Result<String, anyhow::Error> 
     where
         A::Command: DomainCommand,
@@ -103,13 +105,14 @@ impl PostgresStore {
             let id = Uuid::new_v4();
 
             sqlx::query(
-                "INSERT INTO events (id, stream_name, stream_id, event_data, stream_position)
-                 VALUES ($1, $2, $3, $4, $5)"
+                "INSERT INTO events (id, stream_name, stream_id, event_data, metadata, stream_position)
+                 VALUES ($1, $2, $3, $4, $5, $6)"
             )
             .bind(id)
             .bind(&stream_name)
             .bind(&stream_id)
             .bind(&event_json)
+            .bind(&metadata)
             .bind(stream_position)
             .execute(&mut *tx)
             .await?;
@@ -154,7 +157,7 @@ impl PostgresStore {
 
         // Process any events that occurred while we were down
         let rows = sqlx::query(
-            "SELECT event_data, global_position 
+            "SELECT id, stream_name, stream_id, event_data, metadata, stream_position, global_position, created_at
              FROM events 
              WHERE global_position > $1 
              ORDER BY global_position"
@@ -165,7 +168,18 @@ impl PostgresStore {
 
         for row in rows {
             if let Ok(event) = serde_json::from_value(row.get("event_data")) {
-                handler.handle_event(event).await
+                let event_row = EventRow {
+                    id: row.get("id"),
+                    stream_name: row.get("stream_name"),
+                    stream_id: row.get("stream_id"),
+                    event_data: row.get("event_data"),
+                    metadata: row.get("metadata"),
+                    stream_position: row.get("stream_position"),
+                    global_position: row.get("global_position"),
+                    created_at: row.get("created_at"),
+                };
+                
+                handler.handle_event(event, event_row).await
                     .map_err(|e| anyhow::anyhow!("Failed to handle event: {}", e.log_message))?;
                 
                 sqlx::query(
@@ -200,7 +214,7 @@ impl PostgresStore {
                             if global_position > last_position {
                                 // Fetch and process new events
                                 let rows = match sqlx::query(
-                                    "SELECT event_data, global_position 
+                                    "SELECT id, stream_name, stream_id, event_data, metadata, stream_position, global_position, created_at
                                      FROM events 
                                      WHERE global_position > $1 
                                      ORDER BY global_position"
@@ -218,7 +232,18 @@ impl PostgresStore {
 
                                 for row in rows {
                                     if let Ok(event) = serde_json::from_value(row.get("event_data")) {
-                                        match handler.handle_event(event).await {
+                                        let event_row = EventRow {
+                                            id: row.get("id"),
+                                            stream_name: row.get("stream_name"),
+                                            stream_id: row.get("stream_id"),
+                                            event_data: row.get("event_data"),
+                                            metadata: row.get("metadata"),
+                                            stream_position: row.get("stream_position"),
+                                            global_position: row.get("global_position"),
+                                            created_at: row.get("created_at"),
+                                        };
+
+                                        match handler.handle_event(event, event_row).await {
                                             Ok(_) => {
                                                 if let Err(e) = sqlx::query(
                                                     "UPDATE persistent_subscriptions 
@@ -267,7 +292,7 @@ impl PostgresStore {
                 
                 // Get any events after the snapshot
                 let rows = sqlx::query(
-                    "SELECT event_data 
+                    "SELECT id, stream_name, stream_id, event_data, metadata, stream_position, global_position, created_at
                      FROM events 
                      WHERE stream_id = $1 
                      AND global_position > $2
@@ -280,7 +305,17 @@ impl PostgresStore {
 
                 for row in rows {
                     let event: V::Event = serde_json::from_value(row.get("event_data"))?;
-                    view.apply_event(&event);
+                    let event_row = EventRow {
+                        id: row.get("id"),
+                        stream_name: row.get("stream_name"),
+                        stream_id: row.get("stream_id"),
+                        event_data: row.get("event_data"),
+                        metadata: row.get("metadata"),
+                        stream_position: row.get("stream_position"),
+                        global_position: row.get("global_position"),
+                        created_at: row.get("created_at"),
+                    };
+                    view.apply_event(&event, &event_row);
                 }
                 
                 return Ok(Some(view));
@@ -290,7 +325,7 @@ impl PostgresStore {
         // No snapshot or snapshot disabled - rebuild from events
         let mut view = None;
         let rows = sqlx::query(
-            "SELECT event_data 
+            "SELECT id, stream_name, stream_id, event_data, metadata, stream_position, global_position, created_at
              FROM events 
              WHERE stream_id = $1 
              ORDER BY global_position"
@@ -301,12 +336,22 @@ impl PostgresStore {
 
         for row in rows {
             let event: V::Event = serde_json::from_value(row.get("event_data"))?;
+            let event_row = EventRow {
+                id: row.get("id"),
+                stream_name: row.get("stream_name"),
+                stream_id: row.get("stream_id"),
+                event_data: row.get("event_data"),
+                metadata: row.get("metadata"),
+                stream_position: row.get("stream_position"),
+                global_position: row.get("global_position"),
+                created_at: row.get("created_at"),
+            };
             match view {
                 None => {
-                    view = V::initialize(&event);
+                    view = V::initialize(&event, &event_row);
                 }
                 Some(ref mut v) => {
-                    v.apply_event(&event);
+                    v.apply_event(&event, &event_row);
                 }
             }
         }
@@ -381,7 +426,7 @@ impl PostgresStore {
             // Get all events after the snapshots
             if !views.is_empty() {
                 let rows = sqlx::query(
-                    "SELECT stream_id, event_data 
+                    "SELECT id, stream_name, stream_id, event_data, metadata, stream_position, global_position, created_at
                      FROM events 
                      WHERE stream_id = ANY($1) 
                      AND global_position > (
@@ -399,9 +444,19 @@ impl PostgresStore {
 
                 for row in rows {
                     let event: V::Event = serde_json::from_value(row.get("event_data"))?;
+                    let event_row = EventRow {
+                        id: row.get("id"),
+                        stream_name: row.get("stream_name"),
+                        stream_id: row.get("stream_id"),
+                        event_data: row.get("event_data"),
+                        metadata: row.get("metadata"),
+                        stream_position: row.get("stream_position"),
+                        global_position: row.get("global_position"),
+                        created_at: row.get("created_at"),
+                    };
                     let stream_id: String = row.get("stream_id");
                     if let Some(view) = views.get_mut(&stream_id) {
-                        view.apply_event(&event);
+                        view.apply_event(&event, &event_row);
                     }
                 }
             }
@@ -414,7 +469,7 @@ impl PostgresStore {
 
         if !missing_ids.is_empty() {
             let rows = sqlx::query(
-                "SELECT stream_id, event_data 
+                "SELECT id, stream_name, stream_id, event_data, metadata, stream_position, global_position, created_at
                  FROM events 
                  WHERE stream_id = ANY($1) 
                  ORDER BY global_position"
@@ -425,13 +480,23 @@ impl PostgresStore {
 
             for row in rows {
                 let event: V::Event = serde_json::from_value(row.get("event_data"))?;
+                let event_row = EventRow {
+                    id: row.get("id"),
+                    stream_name: row.get("stream_name"),
+                    stream_id: row.get("stream_id"),
+                    event_data: row.get("event_data"),
+                    metadata: row.get("metadata"),
+                    stream_position: row.get("stream_position"),
+                    global_position: row.get("global_position"),
+                    created_at: row.get("created_at"),
+                };
                 let stream_id: String = row.get("stream_id");
                 match views.get_mut(&stream_id) {
                     Some(view) => {
-                        view.apply_event(&event);
+                        view.apply_event(&event, &event_row);
                     }
                     None => {
-                        if let Some(view) = V::initialize(&event) {
+                        if let Some(view) = V::initialize(&event, &event_row) {
                             views.insert(stream_id, view);
                         }
                     }
@@ -493,7 +558,7 @@ impl PostgresStore {
                 
                 // Get any events after the snapshot
                 let rows = sqlx::query(
-                    "SELECT event_data 
+                    "SELECT id, stream_name, stream_id, event_data, metadata, stream_position, global_position, created_at
                      FROM events 
                      WHERE global_position > $1
                      ORDER BY global_position"
@@ -506,7 +571,17 @@ impl PostgresStore {
                 let view = V::default();
                 for row in rows {
                     let event: V::Event = serde_json::from_value(row.get("event_data"))?;
-                    view.update_state(&mut current_state, &event);
+                    let event_row = EventRow {
+                        id: row.get("id"),
+                        stream_name: row.get("stream_name"),
+                        stream_id: row.get("stream_id"),
+                        event_data: row.get("event_data"),
+                        metadata: row.get("metadata"),
+                        stream_position: row.get("stream_position"),
+                        global_position: row.get("global_position"),
+                        created_at: row.get("created_at"),
+                    };
+                    view.update_state(&mut current_state, &event, &event_row);
                 }
                 
                 return Ok(current_state);
@@ -516,7 +591,7 @@ impl PostgresStore {
         // No snapshot or snapshot disabled - rebuild from events
         let mut state = V::initialize_state();
         let rows = sqlx::query(
-            "SELECT event_data 
+            "SELECT id, stream_name, stream_id, event_data, metadata, stream_position, global_position, created_at
              FROM events 
              ORDER BY global_position"
         )
@@ -526,7 +601,17 @@ impl PostgresStore {
         let view = V::default();
         for row in rows {
             let event: V::Event = serde_json::from_value(row.get("event_data"))?;
-            view.update_state(&mut state, &event);
+            let event_row = EventRow {
+                id: row.get("id"),
+                stream_name: row.get("stream_name"),
+                stream_id: row.get("stream_id"),
+                event_data: row.get("event_data"),
+                metadata: row.get("metadata"),
+                stream_position: row.get("stream_position"),
+                global_position: row.get("global_position"),
+                created_at: row.get("created_at"),
+            };
+            view.update_state(&mut state, &event, &event_row);
         }
 
         Ok(state)

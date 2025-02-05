@@ -1,4 +1,5 @@
 use serde::{de::DeserializeOwned, Serialize};
+use crate::event_handler::EventRow;
 
 /// Trait for implementing a read model/view
 pub trait View: Clone + Send + Sync + 'static + DeserializeOwned + Serialize {
@@ -25,10 +26,10 @@ pub trait StreamView: View {
     fn entity_id_from_event(event: &Self::Event) -> Option<String>;
     
     /// Initialize a new view when first relevant event is received
-    fn initialize(event: &Self::Event) -> Option<Self>;
+    fn initialize(event: &Self::Event, event_row: &EventRow) -> Option<Self>;
     
     /// Update view with an event
-    fn apply_event(&mut self, event: &Self::Event);
+    fn apply_event(&mut self, event: &Self::Event, event_row: &EventRow);
 }
 
 /// Trait for views that maintain state across all streams
@@ -45,5 +46,5 @@ pub trait GlobalView: View {
     }
     
     /// Update state with an event
-    fn update_state(&self, state: &mut Self::State, event: &Self::Event);
+    fn update_state(&self, state: &mut Self::State, event: &Self::Event, event_row: &EventRow);
 }

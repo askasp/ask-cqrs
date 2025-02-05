@@ -1,5 +1,6 @@
 use tracing::instrument;
 use uuid::Uuid;
+use serde_json::json;
 
 mod common;
 mod test_utils;
@@ -21,6 +22,7 @@ async fn test_bank_account_aggregate() -> Result<(), anyhow::Error> {
             account_id: None,
         },
         (),
+        json!({"user_id": user_id}),
     )
     .await?;
 
@@ -31,6 +33,7 @@ async fn test_bank_account_aggregate() -> Result<(), anyhow::Error> {
             account_id: stream_id.clone(),
         },
         (),
+        json!({"user_id": user_id}),
     )
     .await?;
 
@@ -41,6 +44,7 @@ async fn test_bank_account_aggregate() -> Result<(), anyhow::Error> {
             account_id: stream_id.clone(),
         },
         (),
+        json!({"user_id": user_id}),
     )
     .await?;
 
@@ -51,6 +55,7 @@ async fn test_bank_account_aggregate() -> Result<(), anyhow::Error> {
             account_id: stream_id.clone(),
         },
         (),
+        json!({"user_id": user_id}),
     )
     .await;
     
@@ -76,6 +81,7 @@ async fn test_bank_account_duplicate_open() -> Result<(), anyhow::Error> {
             account_id: Some(account_id.clone()),
         },
         (),
+        json!({"user_id": "user1"}),
     )
     .await?;
 
@@ -86,6 +92,7 @@ async fn test_bank_account_duplicate_open() -> Result<(), anyhow::Error> {
             account_id: Some(account_id),
         },
         (),
+        json!({"user_id": "user1"}),
     )
     .await;
 
@@ -111,6 +118,7 @@ async fn test_bank_account_nonexistent() -> Result<(), anyhow::Error> {
             account_id,
         },
         (),
+        json!({"user_id": "unknown"}),
     )
     .await;
     

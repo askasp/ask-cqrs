@@ -2,6 +2,7 @@ use ask_cqrs::view::{StreamView, View, GlobalView};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use super::bank_account::BankAccountEvent;
+use ask_cqrs::event_handler::EventRow;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BankAccountView {
@@ -22,7 +23,7 @@ impl StreamView for BankAccountView {
         Some(event.account_id())
     }
 
-    fn initialize(event: &Self::Event) -> Option<Self> {
+    fn initialize(event: &Self::Event, _event_row: &EventRow) -> Option<Self> {
         match event {
             BankAccountEvent::AccountOpened { user_id, .. } => Some(BankAccountView {
                 user_id: user_id.clone(),
@@ -32,7 +33,7 @@ impl StreamView for BankAccountView {
         }
     }
 
-    fn apply_event(&mut self, event: &Self::Event) {
+    fn apply_event(&mut self, event: &Self::Event, _event_row: &EventRow) {
         match event {
             BankAccountEvent::FundsDeposited { amount, .. } => {
                 self.balance += amount;
@@ -71,7 +72,7 @@ impl GlobalView for UserAccountsIndexView {
             .unwrap_or_default()
     }
 
-    fn update_state(&self, state: &mut Self::State, event: &Self::Event) {
+    fn update_state(&self, state: &mut Self::State, event: &Self::Event, _event_row: &EventRow) {
         match event {
             BankAccountEvent::AccountOpened { user_id, account_id } => {
                 state.accounts_by_user
