@@ -14,6 +14,7 @@ use test_utils::{initialize_logger, create_test_store};
 
 #[tokio::test]
 #[instrument]
+#[serial_test::serial]
 async fn test_fraud_detection_handler() -> Result<(), anyhow::Error> {
     initialize_logger();
     let store = create_test_store().await?;
@@ -59,7 +60,7 @@ async fn test_fraud_detection_handler() -> Result<(), anyhow::Error> {
     .await?;
 
     // Wait for the fraud detection handler to process the event
-    sleep(Duration::from_millis(2000)).await;
+    sleep(Duration::from_millis(100)).await;
 
     // Second withdrawal should fail because account is suspended
     let result = store.execute_command::<BankAccountAggregate>(

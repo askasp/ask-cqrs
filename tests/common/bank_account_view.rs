@@ -1,7 +1,8 @@
 use ask_cqrs::view::{StreamView, View, GlobalView};
+use ask_cqrs::aggregate::Aggregate;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use super::bank_account::BankAccountEvent;
+use super::bank_account::{BankAccountAggregate, BankAccountEvent};
 use ask_cqrs::event_handler::EventRow;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,6 +22,10 @@ impl View for BankAccountView {
 impl StreamView for BankAccountView {
     fn entity_id_from_event(event: &Self::Event) -> Option<String> {
         Some(event.account_id())
+    }
+
+    fn stream_name() -> &'static str {
+        BankAccountAggregate::name()
     }
 
     fn initialize(event: &Self::Event, _event_row: &EventRow) -> Option<Self> {

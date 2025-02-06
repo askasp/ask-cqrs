@@ -48,7 +48,7 @@ impl PostgresStore {
         &self,
         stream_id: &str,
     ) -> Result<(Option<A::State>, Option<i64>), anyhow::Error> {
-        let stream_name = format!("{}-{}", "ask_cqrs", A::name());
+        let stream_name = A::name();
         
         let rows = sqlx::query(
             "SELECT event_data, stream_position 
@@ -94,7 +94,7 @@ impl PostgresStore {
         let (state, last_position) = self.build_state::<A>(&stream_id).await?;
         let events = A::execute(&state, &command, &stream_id, service)?;
 
-        let stream_name = format!("{}-{}", "ask_cqrs", A::name());
+        let stream_name = A::name();
         let next_position = last_position.unwrap_or(-1) + 1;
 
         let mut tx = self.pool.begin().await?;
@@ -617,4 +617,76 @@ impl PostgresStore {
 
         Ok(state)
     }
-} 
+
+    /// Get paginated views by querying events table for stream IDs first
+    pub async fn get_paginated_views<V: StreamView>(
+        &self,
+        pagination: PaginationOptions,
+    ) -> Result<PaginatedResult<(String, V)>> {
+        let stream_name = V::stream_name();
+
+        // First get total count of unique stream IDs
+        let count_row = sqlx::query(
+            "SELECT COUNT(DISTINCT stream_id) as count 
+             FROM events 
+             WHERE stream_name = $1"
+        )
+        .bind(&stream_name)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let total_count: i64 = count_row.get("count");
+
+        if total_count == 0 {
+            return Ok(PaginatedResult {
+                items: vec![],
+                total_count: 0,
+                page: pagination.page,
+                total_pages: 0,
+            });
+        }
+
+        // Get paginated stream IDs
+        let stream_ids = sqlx::query(
+            "SELECT DISTINCT stream_id 
+             FROM events 
+             WHERE stream_name = $1
+             ORDER BY stream_id
+             LIMIT $2 OFFSET $3"
+        )
+        .bind(&stream_name)
+        .bind(pagination.page_size)
+        .bind(pagination.page * pagination.page_size)
+        .fetch_all(&self.pool)
+        .await?;
+
+        // Build views for each stream ID
+        let mut items = Vec::with_capacity(stream_ids.len());
+        for row in stream_ids {
+            let stream_id: String = row.get("stream_id");
+            if let Some(view) = self.get_view_state::<V>(&stream_id).await? {
+                items.push((stream_id, view));
+            }
+        }
+
+        Ok(PaginatedResult {
+            items,
+            total_count,
+            page: pagination.page,
+            total_pages: (total_count as f64 / pagination.page_size as f64).ceil() as i64,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PaginationOptions {
+    pub page: i64,
+    pub page_size: i64,
+}
+
+pub struct PaginatedResult<T> {
+    pub items: Vec<T>,
+    pub total_count: i64,
+    pub page: i64,
+    pub total_pages: i64,
+}

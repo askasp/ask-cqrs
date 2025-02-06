@@ -1,14 +1,14 @@
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::time::sleep;
 use tracing::instrument;
 use uuid::Uuid;
 use serde_json::json;
+use serial_test::serial;
 
 mod common;
 mod test_utils;
 
 use ask_cqrs::view::GlobalView;
+use ask_cqrs::postgres_store::{PaginationOptions, PaginatedResult};
 use common::bank_account::{BankAccountAggregate, BankAccountCommand};
 use common::bank_account_view::{BankAccountView, UserAccountsIndexView};
 use common::bank_liquidity_view::BankLiquidityView;
@@ -16,6 +16,7 @@ use test_utils::{initialize_logger, create_test_store};
 
 #[tokio::test]
 #[instrument]
+#[serial_test::serial]
 async fn test_bank_account_view_async() -> Result<(), anyhow::Error> {
     initialize_logger();
     let store = create_test_store().await?;
@@ -55,6 +56,7 @@ async fn test_bank_account_view_async() -> Result<(), anyhow::Error> {
 
 #[tokio::test]
 #[instrument]
+#[serial_test::serial]
 async fn test_bank_account_view_multiple() -> Result<(), anyhow::Error> {
     initialize_logger();
     let store = create_test_store().await?;
@@ -118,6 +120,7 @@ async fn test_bank_account_view_multiple() -> Result<(), anyhow::Error> {
 
 #[tokio::test]
 #[instrument]
+#[serial_test::serial]
 async fn test_user_accounts_index() -> Result<(), anyhow::Error> {
     initialize_logger();
     let store = create_test_store().await?;
@@ -180,6 +183,7 @@ async fn test_user_accounts_index() -> Result<(), anyhow::Error> {
 
 #[tokio::test]
 #[instrument]
+#[serial_test::serial]
 async fn test_batch_view_loading() -> Result<(), anyhow::Error> {
     initialize_logger();
     let store = create_test_store().await?;
@@ -230,6 +234,8 @@ async fn test_batch_view_loading() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
+#[instrument]
+#[serial_test::serial]
 async fn test_bank_liquidity_view() -> Result<(), anyhow::Error> {
     let store = create_test_store().await?;
     
@@ -304,6 +310,94 @@ async fn test_bank_liquidity_view() -> Result<(), anyhow::Error> {
     // Get the view again, should load from snapshot and apply new events
     let liquidity = store.get_global_state::<BankLiquidityView>().await?;
     assert!(liquidity.total_balance >= 2000, "Expected at least 2000 balance, got {}", liquidity.total_balance); // 1200 + 800 = 2000
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
+#[instrument]
+async fn test_paginated_views() -> Result<(), anyhow::Error> {
+    initialize_logger();
+    let store = create_test_store().await?;
+    
+    // Generate a unique user ID for this test
+    let user_id = Uuid::new_v4().to_string();
+
+    // Create 5 accounts with different balances
+    let mut account_ids = Vec::new();
+    let amounts = [100, 200, 300, 400, 500];
+
+    for amount in amounts {
+        // Open account
+        let account_id = store.execute_command::<BankAccountAggregate>(
+            BankAccountCommand::OpenAccount { 
+                user_id: user_id.clone(),
+                account_id: None,
+            },
+            (),
+            json!({"user_id": user_id}),
+        ).await?;
+
+        // Deposit funds
+        store.execute_command::<BankAccountAggregate>(
+            BankAccountCommand::DepositFunds { 
+                amount,
+                account_id: account_id.clone(),
+            },
+            (),
+            json!({"user_id": user_id}),
+        ).await?;
+
+        account_ids.push(account_id);
+    }
+
+    // Test first page (2 items)
+    let page1 = store.get_paginated_views::<BankAccountView>(PaginationOptions {
+        page: 0,
+        page_size: 2,
+    }).await?;
+
+    assert_eq!(page1.total_count, 5);
+    assert_eq!(page1.items.len(), 2);
+    assert_eq!(page1.total_pages, 3);
+    assert_eq!(page1.page, 0);
+
+    // Test second page (2 items)
+    let page2 = store.get_paginated_views::<BankAccountView>(PaginationOptions {
+        page: 1,
+        page_size: 2,
+    }).await?;
+
+    assert_eq!(page2.total_count, 5);
+    assert_eq!(page2.items.len(), 2);
+    assert_eq!(page2.total_pages, 3);
+    assert_eq!(page2.page, 1);
+
+    // Test last page (1 item)
+    let page3 = store.get_paginated_views::<BankAccountView>(PaginationOptions {
+        page: 2,
+        page_size: 2,
+    }).await?;
+
+    assert_eq!(page3.total_count, 5);
+    assert_eq!(page3.items.len(), 1);
+    assert_eq!(page3.total_pages, 3);
+    assert_eq!(page3.page, 2);
+
+    // Verify all accounts were found across pages
+    let mut found_accounts = Vec::new();
+    for (stream_id, view) in page1.items.into_iter()
+        .chain(page2.items.into_iter())
+        .chain(page3.items.into_iter()) {
+        found_accounts.push(stream_id);
+        assert_eq!(view.user_id, user_id);
+    }
+
+    assert_eq!(found_accounts.len(), 5);
+    for account_id in account_ids {
+        assert!(found_accounts.contains(&account_id));
+    }
 
     Ok(())
 } 

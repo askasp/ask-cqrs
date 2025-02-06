@@ -3,7 +3,18 @@ use anyhow::Result;
 use tracing_subscriber;
 
 pub async fn create_test_store() -> Result<ask_cqrs::postgres_store::PostgresStore> {
-      Ok(ask_cqrs::postgres_store::PostgresStore::new("postgres://postgres:postgres@localhost:5432/ask_cqrs_test").await?)
+    // First connect to the database
+    let pool = PgPool::connect("postgres://postgres:postgres@localhost:5432/ask_cqrs_test").await?;
+    
+    // Truncate all tables
+    sqlx::query(
+        "TRUNCATE TABLE events, view_snapshots, persistent_subscriptions RESTART IDENTITY CASCADE"
+    )
+    .execute(&pool)
+    .await?;
+
+    // Create and return the store
+    Ok(ask_cqrs::postgres_store::PostgresStore::new("postgres://postgres:postgres@localhost:5432/ask_cqrs_test").await?)
 }
 
 pub fn initialize_logger() {

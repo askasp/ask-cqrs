@@ -24,6 +24,8 @@ pub trait View: Clone + Send + Sync + 'static + DeserializeOwned + Serialize {
 pub trait StreamView: View {
     /// Extract the entity ID from an event, if this event is relevant
     fn entity_id_from_event(event: &Self::Event) -> Option<String>;
+
+    fn stream_name() -> &'static str;
     
     /// Initialize a new view when first relevant event is received
     fn initialize(event: &Self::Event, event_row: &EventRow) -> Option<Self>;

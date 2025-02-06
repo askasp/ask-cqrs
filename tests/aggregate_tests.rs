@@ -10,6 +10,7 @@ use test_utils::{initialize_logger, create_test_store};
 
 #[tokio::test]
 #[instrument]
+#[serial_test::serial]
 async fn test_bank_account_aggregate() -> Result<(), anyhow::Error> {
     initialize_logger();
     let store = create_test_store().await?;
@@ -69,6 +70,7 @@ async fn test_bank_account_aggregate() -> Result<(), anyhow::Error> {
 
 #[tokio::test]
 #[instrument]
+#[serial_test::serial]
 async fn test_bank_account_duplicate_open() -> Result<(), anyhow::Error> {
     initialize_logger();
     let store = create_test_store().await?;
@@ -106,6 +108,7 @@ async fn test_bank_account_duplicate_open() -> Result<(), anyhow::Error> {
 
 #[tokio::test]
 #[instrument]
+#[serial_test::serial]
 async fn test_bank_account_nonexistent() -> Result<(), anyhow::Error> {
     initialize_logger();
     let store = create_test_store().await?;
