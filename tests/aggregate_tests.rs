@@ -17,7 +17,7 @@ async fn test_bank_account_aggregate() -> Result<(), anyhow::Error> {
     
     // Test opening an account
     let user_id = Uuid::new_v4().to_string();
-    let stream_id = store.execute_command::<BankAccountAggregate>(
+    let res = store.execute_command::<BankAccountAggregate>(
         BankAccountCommand::OpenAccount { 
             user_id: user_id.clone(),
             account_id: None,
@@ -31,7 +31,7 @@ async fn test_bank_account_aggregate() -> Result<(), anyhow::Error> {
     store.execute_command::<BankAccountAggregate>(
         BankAccountCommand::DepositFunds { 
             amount: 100,
-            account_id: stream_id.clone(),
+            account_id: res.stream_id.clone(),
         },
         (),
         json!({"user_id": user_id}),
@@ -42,7 +42,7 @@ async fn test_bank_account_aggregate() -> Result<(), anyhow::Error> {
     store.execute_command::<BankAccountAggregate>(
         BankAccountCommand::WithdrawFunds { 
             amount: 50,
-            account_id: stream_id.clone(),
+            account_id: res.stream_id.clone(),
         },
         (),
         json!({"user_id": user_id}),
@@ -53,7 +53,7 @@ async fn test_bank_account_aggregate() -> Result<(), anyhow::Error> {
     let result = store.execute_command::<BankAccountAggregate>(
         BankAccountCommand::WithdrawFunds { 
             amount: 1000,
-            account_id: stream_id.clone(),
+            account_id: res.stream_id.clone(),
         },
         (),
         json!({"user_id": user_id}),

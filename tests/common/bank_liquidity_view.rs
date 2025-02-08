@@ -1,17 +1,26 @@
-use ask_cqrs::view::{View, GlobalView};
+use ask_cqrs::view::View;
 use serde::{Deserialize, Serialize};
+use crate::common::bank_account::BankAccountAggregate;
+use ask_cqrs::aggregate::Aggregate;
+
 use super::bank_account::BankAccountEvent;
 use ask_cqrs::event_handler::EventRow;
 
 // Bank liquidity tracking across all accounts
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct BankLiquidityState {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BankLiquidityView {
     pub total_balance: u64,
     pub total_accounts: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct BankLiquidityView;
+impl Default for BankLiquidityView {
+    fn default() -> Self {
+        Self {
+            total_balance: 0,
+            total_accounts: 0,
+        }
+    }
+}
 
 impl View for BankLiquidityView {
     type Event = BankAccountEvent;
@@ -20,30 +29,28 @@ impl View for BankLiquidityView {
         "bank_liquidity_view".to_string()
     }
 
-    fn snapshot_frequency() -> Option<u32> {
-        Some(100) // Take snapshot every 100 events
-    }
-}
-
-impl GlobalView for BankLiquidityView {
-    type State = BankLiquidityState;
-
-    fn query(&self, state: &Self::State, _criteria: &str) -> Vec<String> {
-        // This view doesn't really need query functionality
-        // but we could return accounts with balance > criteria if needed
-        Vec::new()
+    fn stream_names() -> Vec<&'static str> {
+        vec![BankAccountAggregate::name()]
     }
 
-    fn update_state(&self, state: &mut Self::State, event: &Self::Event, _event_row: &EventRow) {
+    fn get_partition_key(_event: &Self::Event, _event_row: &EventRow) -> Option<String> {
+        Some("aggregate".to_string()) // Single global view tracking aggregate metrics
+    }
+
+    fn initialize(_event: &Self::Event, _event_row: &EventRow) -> Option<Self> {
+        Some(Self::default())
+    }
+
+    fn apply_event(&mut self, event: &Self::Event, _event_row: &EventRow) {
         match event {
             BankAccountEvent::AccountOpened { .. } => {
-                state.total_accounts += 1;
+                self.total_accounts += 1;
             }
             BankAccountEvent::FundsDeposited { amount, .. } => {
-                state.total_balance += amount;
+                self.total_balance += amount;
             }
             BankAccountEvent::FundsWithdrawn { amount, .. } => {
-                state.total_balance -= amount;
+                self.total_balance -= amount;
             }
             _ => {}
         }

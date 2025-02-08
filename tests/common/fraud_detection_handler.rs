@@ -38,7 +38,7 @@ impl EventHandler for FraudDetectionHandler {
                         "reason": "suspicious_withdrawal",
                         "triggered_by_event": event_row.id,
                         "amount": amount
-                    }),
+                    }) 
                 ).await.map_err(|e| EventHandlerError {
                     log_message: format!("Failed to suspend account: {}", e),
                 })?;

@@ -27,7 +27,7 @@ async fn test_fraud_detection_handler() -> Result<(), anyhow::Error> {
     let user_id = Uuid::new_v4().to_string();
 
     // Open account
-    let account_id = store.execute_command::<BankAccountAggregate>(
+    let res = store.execute_command::<BankAccountAggregate>(
         BankAccountCommand::OpenAccount { 
             user_id: user_id.clone(),
             account_id: None,
@@ -36,6 +36,7 @@ async fn test_fraud_detection_handler() -> Result<(), anyhow::Error> {
         json!({"user_id": user_id}),
     )
     .await?;
+    let account_id = res.stream_id;
 
     // Deposit 5000 to ensure we have enough funds
     store.execute_command::<BankAccountAggregate>(
@@ -98,7 +99,7 @@ async fn test_fraud_detection_handler_small_withdrawals() -> Result<(), anyhow::
     let user_id = Uuid::new_v4().to_string();
 
     // Open account
-    let account_id = store.execute_command::<BankAccountAggregate>(
+    let res = store.execute_command::<BankAccountAggregate>(
         BankAccountCommand::OpenAccount { 
             user_id: user_id.clone(),
             account_id: None,
@@ -107,6 +108,7 @@ async fn test_fraud_detection_handler_small_withdrawals() -> Result<(), anyhow::
         json!({"user_id": user_id}),
     )
     .await?;
+    let account_id = res.stream_id;
 
     // Deposit 3000 to ensure we have enough funds
     store.execute_command::<BankAccountAggregate>(

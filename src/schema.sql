@@ -45,11 +45,12 @@ CREATE TRIGGER events_notify_trigger
 CREATE TABLE IF NOT EXISTS view_snapshots (
     id TEXT PRIMARY KEY,
     view_name TEXT NOT NULL,
-    stream_id TEXT NOT NULL,
+    partition_key TEXT NOT NULL,
     state JSONB NOT NULL,
     last_event_position BIGINT NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(view_name, stream_id)
+    UNIQUE(view_name, partition_key)
 );
 
-CREATE INDEX IF NOT EXISTS idx_view_snapshots_view ON view_snapshots(view_name, stream_id); 
+-- Index for efficient view snapshot lookups
+CREATE INDEX IF NOT EXISTS idx_view_snapshots_lookup ON view_snapshots(view_name, partition_key); 

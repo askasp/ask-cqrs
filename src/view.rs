@@ -9,44 +9,24 @@ pub trait View: Clone + Send + Sync + 'static + DeserializeOwned + Serialize {
     /// Name of the view, used for logging and debugging
     fn name() -> String;
     
-    /// Optional snapshot configuration - how many events before taking a snapshot
-    fn snapshot_frequency() -> Option<u32> {
-        None // By default, no snapshots
+    /// Get the stream names this view is interested in
+    fn stream_names() -> Vec<&'static str>;
+
+    /// Get the partition key for this event
+    /// This determines how the view state is split across rows
+    /// Return None to skip this event
+    fn get_partition_key(event: &Self::Event, event_row: &EventRow) -> Option<String> {
+        Some("aggregate".to_string()) // Default to single partition
     }
 
-    /// Optional event filtering - which event types to process
-    fn event_types() -> Vec<String> {
-        vec![] // Empty means all events
-    }
-}
-
-/// Trait for views that maintain state for individual streams
-pub trait StreamView: View {
-    /// Extract the entity ID from an event, if this event is relevant
-    fn entity_id_from_event(event: &Self::Event) -> Option<String>;
-
-    fn stream_name() -> &'static str;
-    
     /// Initialize a new view when first relevant event is received
     fn initialize(event: &Self::Event, event_row: &EventRow) -> Option<Self>;
     
     /// Update view with an event
     fn apply_event(&mut self, event: &Self::Event, event_row: &EventRow);
-}
 
-/// Trait for views that maintain state across all streams
-pub trait GlobalView: View {
-    /// The global state type
-    type State: Clone + Send + Sync + 'static + DeserializeOwned + Serialize + Default;
-
-    /// Query the state with the given criteria
-    fn query(&self, state: &Self::State, criteria: &str) -> Vec<String>;
-    
-    /// Initialize a new state
-    fn initialize_state() -> Self::State {
-        Self::State::default()
+    /// Query the view state with the given criteria (optional)
+    fn query(state: &Self, criteria: &str) -> Vec<String> {
+        vec![] // Default implementation returns empty list
     }
-    
-    /// Update state with an event
-    fn update_state(&self, state: &mut Self::State, event: &Self::Event, event_row: &EventRow);
 }
