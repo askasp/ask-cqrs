@@ -29,9 +29,6 @@ impl View for BankLiquidityView {
         "bank_liquidity_view".to_string()
     }
 
-    fn stream_names() -> Vec<&'static str> {
-        vec![BankAccountAggregate::name()]
-    }
 
     fn get_partition_key(_event: &Self::Event, _event_row: &EventRow) -> Option<String> {
         Some("aggregate".to_string()) // Single global view tracking aggregate metrics

@@ -392,13 +392,11 @@ impl PostgresStore {
             "SELECT id, stream_name, stream_id, event_data, metadata, stream_position, global_position, created_at
              FROM events 
              WHERE global_position > $1
-             AND stream_name = ANY($2)
              ORDER BY global_position"
         );
 
         let rows = sqlx::query(&query)
             .bind(last_position)
-            .bind(&V::stream_names())
             .fetch_all(&self.pool)
             .await?;
 
@@ -529,13 +527,11 @@ impl PostgresStore {
                                     "SELECT id, stream_name, stream_id, event_data, metadata, stream_position, global_position, created_at
                                      FROM events 
                                      WHERE global_position > $1
-                                     AND stream_name = ANY($2)
                                      ORDER BY global_position"
                                 );
 
                                 match sqlx::query(&query)
                                     .bind(last_position)
-                                    .bind(&V::stream_names())
                                     .fetch_all(&pool)
                                     .await 
                                 {

@@ -28,9 +28,6 @@ impl View for BankAccountView {
         "bank_account_view".to_string()
     }
 
-    fn stream_names() -> Vec<&'static str> {
-        vec![BankAccountAggregate::name()]
-    }
 
     fn get_partition_key(event: &Self::Event, _event_row: &EventRow) -> Option<String> {
         Some(event.account_id()) // Each account gets its own row
