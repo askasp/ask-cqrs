@@ -9,6 +9,7 @@ pub trait View: Clone + Send + Sync + 'static + DeserializeOwned + Serialize {
     /// Name of the view, used for logging and debugging
     fn name() -> String;
 
+
     /// Get the partition key for this event
     /// This determines how the view state is split across rows
     /// Return None to skip this event

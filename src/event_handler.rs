@@ -27,7 +27,6 @@ pub trait EventHandler: Send + Sync + 'static {
     /// The event type this handler processes
     type Events: DeserializeOwned + Send + Sync + 'static;
     /// Service dependencies
-    type Service: Send + Sync + 'static;
 
     fn name() -> &'static str;
     

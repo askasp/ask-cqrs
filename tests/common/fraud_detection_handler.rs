@@ -19,7 +19,6 @@ impl FraudDetectionHandler {
 #[async_trait::async_trait]
 impl EventHandler for FraudDetectionHandler {
     type Events = BankAccountEvent;
-    type Service = ();
 
     fn name() -> &'static str {
         "fraud_detection_handler"
