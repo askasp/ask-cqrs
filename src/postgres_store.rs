@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use anyhow::Result;
-use sqlx::{postgres::{PgPool, PgListener}, Row};
+use sqlx::{postgres::{PgPool, PgListener}, Row, Executor};
 use uuid::Uuid;
 use tracing::instrument;
 use tokio::sync::broadcast;
@@ -31,11 +31,36 @@ pub struct PostgresStore {
 }
 
 impl PostgresStore {
+    /// Check if the event store schema exists
+    async fn check_schema_exists(pool: &PgPool) -> Result<bool> {
+        let row = sqlx::query(
+            "SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_name = 'events'
+            )"
+        )
+        .fetch_one(pool)
+        .await?;
+
+        Ok(row.get::<bool, _>(0))
+    }
+
     /// Create a new PostgreSQL store with the given connection string
     pub async fn new(connection_string: &str) -> Result<Self> {
         let pool = PgPool::connect(connection_string)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to create pool: {}", e))?;
+
+        // Only initialize schema if this is a new database
+        if !Self::check_schema_exists(&pool).await? {
+            tracing::info!("Initializing new event store schema");
+            let schema = include_str!("schema.sql");
+            let mut tx = pool.begin().await?;
+            tx.execute(schema)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to initialize schema: {}", e))?;
+            tx.commit().await?;
+        }
 
         let (shutdown, _) = broadcast::channel(1);
 

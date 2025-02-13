@@ -4,7 +4,7 @@ use tracing_subscriber;
 
 pub async fn create_test_store() -> Result<ask_cqrs::postgres_store::PostgresStore> {
     // First connect to the database
-    let pool = PgPool::connect("postgres://postgres:postgres@localhost:5432/ask_cqrs_test").await?;
+    let pool = PgPool::connect("postgres://postgres:postgres@localhost:5432/ask_cqrs_test2").await?;
     
     // Stop all view builders and event handlers by removing their subscriptions
     sqlx::query("DELETE FROM persistent_subscriptions")
@@ -29,8 +29,8 @@ pub async fn create_test_store() -> Result<ask_cqrs::postgres_store::PostgresSto
     .execute(&pool)
     .await?;
 
-    // Create and return the store with a fresh connection
-    let store = ask_cqrs::postgres_store::PostgresStore::new("postgres://postgres:postgres@localhost:5432/ask_cqrs_test").await?;
+    // Create and return the store with a fresh connection - using the same database name
+    let store = ask_cqrs::postgres_store::PostgresStore::new("postgres://postgres:postgres@localhost:5432/ask_cqrs_test2").await?;
     
     // Wait longer to ensure store is fully initialized
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
