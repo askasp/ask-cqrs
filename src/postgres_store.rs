@@ -4,7 +4,7 @@ use sqlx::{postgres::{PgPool, PgListener}, Row, Executor};
 use uuid::Uuid;
 use tracing::instrument;
 use tokio::sync::broadcast;
-use serde_json::{self, Value as JsonValue};
+use serde_json::{self, Value as JsonValue, json};
 use std::collections::HashMap;
 use crate::event_handler::EventRow;
 use async_trait::async_trait;
@@ -819,6 +819,40 @@ impl PostgresStore {
         .await?;
 
         Ok(())
+    }
+
+    /// Get a single view by user_id field
+    /// Returns the first matching view, if any
+    pub async fn get_view_by_user_id<V: View>(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<V>> {
+        let res = self.query_views::<V>(
+            "state->>'user_id' = ($2#>>'{}')::text",
+            vec![json!(user_id)],
+            None,
+        ).await?;
+        Ok(res.items.first().cloned())
+    }
+
+    /// Get all views for a given user_id
+    /// Returns all views where user_id matches
+    pub async fn get_views_by_user_id<V: View>(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<V>> {
+        let res = self.query_views::<V>(
+            "state->>'user_id' = ($2#>>'{}')::text",
+            vec![json!(user_id)],
+            None,
+        ).await?;
+        Ok(res.items)
+    }
+
+    /// Get all views without any filtering
+    pub async fn get_all_views<V: View>(&self) -> Result<Vec<V>> {
+        let res = self.query_views::<V>("true", vec![], None).await?;
+        Ok(res.items)
     }
 }
 
