@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow};
 use sqlx::{postgres::{PgPool, PgListener}, postgres::PgRow, Row, Executor, PgExecutor, FromRow};
 use uuid::Uuid;
-use tracing::{info, warn, error, debug, instrument, Span, trace, info_span};
+use tracing::{info, warn, error, debug, instrument, Span, trace, info_span, Level, enabled};
 use tokio::sync::broadcast;
 use serde_json::{self, Value as JsonValue, json};
 use chrono::{DateTime, Utc};
@@ -36,6 +36,7 @@ pub struct PostgresEventStore {
     pool: PgPool,
     node_id: String,
     shutdown: broadcast::Sender<()>,
+    reduced_logging: bool,
 }
 
 impl PostgresEventStore {
@@ -53,12 +54,27 @@ impl PostgresEventStore {
             pool,
             node_id,
             shutdown: broadcast::channel(1).0,
+            reduced_logging: false,
         };
 
         // Initialize schema if needed
         store.initialize().await?;
 
         Ok(store)
+    }
+    
+    /// Create a new PostgreSQL event store with reduced logging (for tests)
+    pub async fn new_with_reduced_logging(connection_string: &str) -> Result<Self> {
+        let store = Self::new(connection_string).await?;
+        Ok(Self {
+            reduced_logging: true,
+            ..store
+        })
+    }
+    
+    /// Helper function to determine if a debug message should be logged
+    fn should_log_debug(&self) -> bool {
+        !self.reduced_logging && enabled!(Level::DEBUG)
     }
 
     /// Check if a table exists in the database
@@ -101,8 +117,10 @@ impl PostgresEventStore {
         handler_name: &str,
         config: &EventProcessingConfig,
     ) -> Result<Option<StreamClaim>> {
-        tracing::debug!("Attempting to claim stream {}/{} for handler {}", 
+        if self.should_log_debug() {
+            tracing::debug!("Attempting to claim stream {}/{} for handler {}", 
                       stream_name, stream_id, handler_name);
+        }
         
         let claim_ttl = config.claim_ttl;
         let now = Utc::now();
@@ -122,23 +140,25 @@ impl PostgresEventStore {
         .fetch_optional(&self.pool)
         .await?;
 
-        if let Some(row) = &existing_claim {
-            let claimed_by: Option<String> = row.get("claimed_by");
-            let expires_at: Option<DateTime<Utc>> = row.get("claim_expires_at");
+        if self.should_log_debug() {
+            if let Some(row) = &existing_claim {
+                let claimed_by: Option<String> = row.get("claimed_by");
+                let expires_at: Option<DateTime<Utc>> = row.get("claim_expires_at");
+                
+                tracing::debug!(
+                    "Found existing claim for {}/{}, handler={}: claimed_by={:?}, expires_at={:?}",
+                    stream_name, stream_id, handler_name, claimed_by, expires_at
+                );
+            } else {
+                tracing::debug!(
+                    "No existing claim found for {}/{}, handler={}. Will create new claim.",
+                    stream_name, stream_id, handler_name
+                );
+            }
             
-            tracing::debug!(
-                "Found existing claim for {}/{}, handler={}: claimed_by={:?}, expires_at={:?}",
-                stream_name, stream_id, handler_name, claimed_by, expires_at
-            );
-        } else {
-            tracing::debug!(
-                "No existing claim found for {}/{}, handler={}. Will create new claim.",
-                stream_name, stream_id, handler_name
-            );
+            tracing::debug!("Creating claim record for {}/{}, handler={}", 
+                          stream_name, stream_id, handler_name);
         }
-        
-        tracing::debug!("Creating claim record for {}/{}, handler={}", 
-                      stream_name, stream_id, handler_name);
         
         let insert_result = sqlx::query(
             r#"
@@ -157,12 +177,13 @@ impl PostgresEventStore {
         .execute(&self.pool)
         .await?;
         
-        tracing::debug!("Insert result: {} rows affected", insert_result.rows_affected());
-
-        // Now try to claim it if it's unclaimed or expired or ready for retry
-        tracing::debug!("Attempting to update claim for {}/{}, handler={}", 
-                       stream_name, stream_id, handler_name);
+        if self.should_log_debug() {
+            tracing::debug!("Insert result: {} rows affected", insert_result.rows_affected());
+            tracing::debug!("Attempting to update claim for {}/{}, handler={}", 
+                           stream_name, stream_id, handler_name);
+        }
         
+        // Now try to claim it if it's unclaimed or expired or ready for retry
         let claim_result = sqlx::query(
             r#"
             UPDATE event_processing_claims
@@ -203,64 +224,71 @@ impl PostgresEventStore {
         if let Some(row) = claim_result {
             // Use FromRow implementation instead of manual conversion
             let stream_claim = StreamClaim::from_row(&row)?;
-            tracing::debug!("Successfully claimed stream {}/{} for handler {}", 
-                           stream_name, stream_id, handler_name);
+            
+            if self.should_log_debug() {
+                tracing::debug!("Successfully claimed stream {}/{} for handler {}", 
+                               stream_name, stream_id, handler_name);
+            }
+            
             Ok(Some(stream_claim))
         } else {
             // Check why the claim failed
-            let claim_status = sqlx::query(
-                r#"
-                SELECT 
-                    claimed_by, 
-                    claim_expires_at, 
-                    next_retry_at,
-                    last_updated_at
-                FROM event_processing_claims
-                WHERE 
-                    stream_name = $1 AND 
-                    stream_id = $2 AND 
-                    handler_name = $3
-                "#
-            )
-            .bind(stream_name)
-            .bind(stream_id)
-            .bind(handler_name)
-            .fetch_optional(&self.pool)
-            .await?;
-            
-            if let Some(row) = claim_status {
-                let claimed_by: Option<String> = row.get("claimed_by");
-                let expires_at: Option<DateTime<Utc>> = row.get("claim_expires_at");
-                let retry_at: Option<DateTime<Utc>> = row.get("next_retry_at");
-                let updated_at: DateTime<Utc> = row.get("last_updated_at");
+            if self.should_log_debug() {
+                let claim_status = sqlx::query(
+                    r#"
+                    SELECT 
+                        claimed_by, 
+                        claim_expires_at, 
+                        next_retry_at,
+                        last_updated_at
+                    FROM event_processing_claims
+                    WHERE 
+                        stream_name = $1 AND 
+                        stream_id = $2 AND 
+                        handler_name = $3
+                    "#
+                )
+                .bind(stream_name)
+                .bind(stream_id)
+                .bind(handler_name)
+                .fetch_optional(&self.pool)
+                .await?;
                 
-                tracing::debug!(
-                    "Claim failed for {}/{}, handler={}: claimed_by={:?}, expires_at={:?}, retry_at={:?}, updated_at={:?}",
-                    stream_name, stream_id, handler_name, claimed_by, expires_at, retry_at, updated_at
-                );
-                
-                if let Some(claimed) = claimed_by {
-                    if claimed == self.node_id {
-                        tracing::debug!("Stream already claimed by this node: {}", self.node_id);
-                    } else {
-                        tracing::debug!("Stream claimed by another node: {}", claimed);
+                if let Some(row) = claim_status {
+                    let claimed_by: Option<String> = row.get("claimed_by");
+                    let expires_at: Option<DateTime<Utc>> = row.get("claim_expires_at");
+                    let retry_at: Option<DateTime<Utc>> = row.get("next_retry_at");
+                    let updated_at: DateTime<Utc> = row.get("last_updated_at");
+                    
+                    tracing::debug!(
+                        "Claim failed for {}/{}, handler={}: claimed_by={:?}, expires_at={:?}, retry_at={:?}, updated_at={:?}",
+                        stream_name, stream_id, handler_name, claimed_by, expires_at, retry_at, updated_at
+                    );
+                    
+                    if let Some(claimed) = claimed_by {
+                        if claimed == self.node_id {
+                            tracing::debug!("Stream already claimed by this node: {}", self.node_id);
+                        } else {
+                            tracing::debug!("Stream claimed by another node: {}", claimed);
+                        }
                     }
+                    
+                    if let Some(expires) = expires_at {
+                        if expires > now {
+                            tracing::debug!("Claim not expired yet. Expires in {} seconds", 
+                                         (expires - now).num_seconds());
+                        } else {
+                            tracing::debug!("Claim is expired, but update failed");
+                        }
+                    }
+                } else {
+                    tracing::debug!("No claim record found during status check, but create/update failed");
                 }
                 
-                if let Some(expires) = expires_at {
-                    if expires > now {
-                        tracing::debug!("Claim not expired yet. Expires in {} seconds", 
-                                     (expires - now).num_seconds());
-                    } else {
-                        tracing::debug!("Claim is expired, but update failed");
-                    }
-                }
-            } else {
-                tracing::debug!("No claim record found during status check, but create/update failed");
+                tracing::debug!("Failed to claim stream {}/{} for handler {}", 
+                               stream_name, stream_id, handler_name);
             }
             
-            tracing::debug!("Failed to claim stream {}/{} for handler {}", 
-                           stream_name, stream_id, handler_name);
             Ok(None)
         }
     }
@@ -503,13 +531,15 @@ impl PostgresEventStore {
     where
         H: EventHandler + Send + Sync,
     {
-        tracing::debug!(
-            handler = %H::name(),
-            stream_name = %stream_name,
-            stream_id = %stream_id,
-            last_position = last_position,
-            "Processing events for handler"
-        );
+        if self.should_log_debug() {
+            tracing::debug!(
+                handler = %H::name(),
+                stream_name = %stream_name,
+                stream_id = %stream_id,
+                last_position = last_position,
+                "Processing events for handler"
+            );
+        }
         
         // Get events for this stream that need processing
         let fetch_span = info_span!("fetch_events", after_position = last_position, batch_size = config.batch_size);
@@ -522,7 +552,9 @@ impl PostgresEventStore {
         ).await?;
         drop(_fetch_guard);
         
-        tracing::debug!(event_count = events.len(), "Found events to process for handler");
+        if self.should_log_debug() {
+            tracing::debug!(event_count = events.len(), "Found events to process for handler");
+        }
         
         if events.is_empty() {
             return Ok(last_position);
@@ -559,10 +591,12 @@ impl PostgresEventStore {
             }
         }
         
-        tracing::debug!(
-            new_position = max_position,
-            "Processed events for handler"
-        );
+        if self.should_log_debug() {
+            tracing::debug!(
+                new_position = max_position,
+                "Processed events for handler"
+            );
+        }
         
         Ok(max_position)
     }
@@ -717,7 +751,9 @@ impl PostgresEventStore {
                 config
             ).await {
                 claimed_count += 1;
-                debug!("Claimed stream {}/{} for handler {}", stream_name, stream_id, handler_name);
+                if self.should_log_debug() {
+                    debug!("Claimed stream {}/{} for handler {}", stream_name, stream_id, handler_name);
+                }
             }
         }
         
@@ -743,60 +779,111 @@ impl PostgresEventStore {
         .fetch_all(&self.pool)
         .await?;
         
-        let mut processed_count = 0;
+        let claimed_count = claimed_streams.len();
+        if claimed_count == 0 {
+            return Ok(0);
+        }
         
-        // Process each claimed stream
+        if self.should_log_debug() {
+            debug!("Processing {} claimed streams concurrently", claimed_count);
+        }
+        
+        // Process each claimed stream concurrently
+        let mut tasks = Vec::with_capacity(claimed_count);
+        
         for row in claimed_streams {
             let stream_name: String = row.get("stream_name");
             let stream_id: String = row.get("stream_id");
             let last_position: i64 = row.get("last_position");
             
-            debug!("Processing claimed stream {}/{} from position {}", 
-                   stream_name, stream_id, last_position);
-            
-            // Process the stream's events
-            match self.process_stream_events(
-                handler,
-                &stream_name,
-                &stream_id,
-                last_position,
-                config
-            ).await {
-                Ok(position) => {
-                    debug!("Successfully processed stream {}/{} up to position {}",
-                           stream_name, stream_id, position);
-                    
-                    if let Err(e) = self.update_stream_claim_success(
-                        &stream_name,
-                        &stream_id,
-                        H::name(),
-                        position
-                    ).await {
-                        error!("Error updating claim success: {}", e);
-                    }
-                    processed_count += 1;
-                },
-                Err(e) => {
-                    error!("Error processing stream events: {}", e);
-                    if let Err(e) = self.update_stream_claim_error(
-                        &stream_name,
-                        &stream_id,
-                        H::name(),
-                        &e.to_string(),
-                        config
-                    ).await {
-                        error!("Error updating claim error: {}", e);
-                    }
-                }
+            if self.should_log_debug() {
+                debug!("Spawning task for claimed stream {}/{} from position {}", 
+                      stream_name, stream_id, last_position);
             }
             
-            // Release the claim when done
-            if let Err(e) = self.release_stream(
-                &stream_name,
-                &stream_id,
-                H::name()
-            ).await {
-                error!("Error releasing stream claim: {}", e);
+            // Clone the necessary components for the task
+            let store_clone = self.clone();
+            let handler_clone = handler.clone();
+            let config_clone = config.clone();
+            let stream_name_clone = stream_name.clone();
+            let stream_id_clone = stream_id.clone();
+            
+            // Spawn a task for this stream
+            let task = tokio::spawn(async move {
+                let process_span = info_span!(
+                    "process_stream", 
+                    stream_name = %stream_name_clone, 
+                    stream_id = %stream_id_clone,
+                    last_position = last_position
+                );
+                
+                async {
+                    // Process the stream's events
+                    match store_clone.process_stream_events(
+                        &handler_clone,
+                        &stream_name_clone,
+                        &stream_id_clone,
+                        last_position,
+                        &config_clone
+                    ).await {
+                        Ok(position) => {
+                            if store_clone.should_log_debug() {
+                                debug!("Successfully processed stream {}/{} up to position {}",
+                                    stream_name_clone, stream_id_clone, position);
+                            }
+                            
+                            if let Err(e) = store_clone.update_stream_claim_success(
+                                &stream_name_clone,
+                                &stream_id_clone,
+                                H::name(),
+                                position
+                            ).await {
+                                error!("Error updating claim success: {}", e);
+                            }
+                            Result::<bool, anyhow::Error>::Ok(true)
+                        },
+                        Err(e) => {
+                            error!("Error processing stream events: {}", e);
+                            if let Err(e) = store_clone.update_stream_claim_error(
+                                &stream_name_clone,
+                                &stream_id_clone,
+                                H::name(),
+                                &e.to_string(),
+                                &config_clone
+                            ).await {
+                                error!("Error updating claim error: {}", e);
+                            }
+                            Result::<bool, anyhow::Error>::Ok(false)
+                        }
+                    }?;
+                    
+                    // Release the claim when done
+                    if let Err(e) = store_clone.release_stream(
+                        &stream_name_clone,
+                        &stream_id_clone,
+                        H::name()
+                    ).await {
+                        error!("Error releasing stream claim: {}", e);
+                    }
+                    
+                    Result::<bool, anyhow::Error>::Ok(true)
+                }.instrument(process_span).await
+            });
+            
+            tasks.push(task);
+        }
+        
+        // Wait for all tasks to complete
+        let results = join_all(tasks).await;
+        
+        // Count successful processing
+        let mut processed_count = 0;
+        for result in results {
+            match result {
+                Ok(Ok(true)) => processed_count += 1,
+                Ok(Ok(false)) => {}, // Processing failed but handled
+                Ok(Err(e)) => error!("Error in stream processing task: {}", e),
+                Err(e) => error!("Task join error: {}", e),
             }
         }
         

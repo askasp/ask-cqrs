@@ -180,30 +180,33 @@ async fn create_account_with_events(store: &PostgresEventStore) -> Result<(Strin
     Ok((account_id, user_id))
 }
 
+
+
 #[tokio::test]
 #[instrument]
 #[serial]
 async fn test_dead_letter_queue_and_retries() -> Result<()> {
     initialize_logger();
     
-    // Create store and handlers
+    // Create store and handlers with reduced logging
     let store = create_test_store().await?;
     
-    // Set max retries to 2 (will retry twice, then dead-letter)
+    // Set max retries to 1 and use higher polling intervals to reduce log spam
     let event_config = EventProcessingConfig {
-        max_retries: 1,               // Lower to 1 so we move to dead letter queue faster
-        base_retry_delay: Duration::from_millis(50),
-        max_retry_delay: Duration::from_millis(200),
-        claim_ttl: Duration::from_millis(500),
-        poll_interval: Duration::from_millis(100),
+        max_retries: 1,
+        base_retry_delay: Duration::from_millis(200),
+        max_retry_delay: Duration::from_millis(500),
+        claim_ttl: Duration::from_millis(1000),
+        poll_interval: Duration::from_millis(500),  // Increased from 100ms to 500ms
         ..Default::default()
     };
     
     // Print configuration for debugging
-    info!("Test config: max_retries={}, base_delay={:?}, max_delay={:?}", 
+    info!("Test config: max_retries={}, base_delay={:?}, max_delay={:?}, poll_interval={:?}", 
           event_config.max_retries, 
           event_config.base_retry_delay,
-          event_config.max_retry_delay);
+          event_config.max_retry_delay,
+          event_config.poll_interval);
     
     // Create handler that will fail after max_retries
     let retry_handler = RetryThenFailHandler::new(store.clone(), 1);  // Match max_retries in config
@@ -240,9 +243,9 @@ async fn test_dead_letter_queue_and_retries() -> Result<()> {
     info!("Handler name: {}", RetryThenFailHandler::name());
     
     // Wait for event processing attempts and dead letter placement
-    // Need to wait for max_retries + 1 attempts plus some retry delay
+    // With max_retries=1 and base_retry_delay=200ms, we should need less time
     info!("Waiting for retry attempts and dead letter placement...");
-    sleep(Duration::from_secs(15)).await;  // Increase from 7 to 15 seconds for better reliability
+    sleep(Duration::from_secs(5)).await;  // Reduced from 15 to 5 seconds
     
     // Check if we have any events in the dead letter queue
     let dead_letter_events = store.get_dead_letter_events(0, 10).await?;
@@ -354,7 +357,7 @@ async fn test_dead_letter_queue_and_retries() -> Result<()> {
     ).await?;
     
     // Wait for it to be processed
-    sleep(Duration::from_millis(500)).await;
+    sleep(Duration::from_millis(1000)).await;
     
     // Check the always succeed handler got the latest events
     let final_events = always_succeed.get_processed_events();
