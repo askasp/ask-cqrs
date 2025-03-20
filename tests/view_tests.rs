@@ -7,17 +7,18 @@ use serial_test::serial;
 mod common;
 mod test_utils;
 
-use ask_cqrs::postgres_store::PaginationOptions;
+use ask_cqrs::store::event_store::{EventStore, PaginationOptions};
 use common::bank_account::{BankAccountAggregate, BankAccountCommand};
 use common::bank_account_view::BankAccountView;
 use common::bank_liquidity_view::BankLiquidityView;
 use test_utils::{initialize_logger, create_test_store};
+use ask_cqrs::store::postgres_event_store::PostgresEventStore;
 
 const VIEW_TIMEOUT_MS: u64 = 5000;
 
-async fn initialize_view_builders(store: &Arc<ask_cqrs::postgres_store::PostgresStore>) -> Result<(), anyhow::Error> {
-    store.start_view_builder::<BankAccountView>().await?;
-    store.start_view_builder::<BankLiquidityView>().await?;
+async fn initialize_view_builders(store: &Arc<PostgresEventStore>) -> Result<(), anyhow::Error> {
+    store.start_view_builder::<BankAccountView>(None).await?;
+    store.start_view_builder::<BankLiquidityView>(None).await?;
     Ok(())
 }
 
@@ -29,7 +30,7 @@ async fn test_bank_account_view_async() -> Result<(), anyhow::Error> {
     let store = Arc::new(create_test_store().await?);
     
     // Start view builder
-    store.start_view_builder::<BankAccountView>().await?;
+    store.start_view_builder::<BankAccountView>(None).await?;
     
     // Generate a unique user ID for this test
     let user_id = Uuid::new_v4().to_string();
@@ -78,7 +79,7 @@ async fn test_bank_liquidity_view() -> Result<(), anyhow::Error> {
     let store = Arc::new(create_test_store().await?);
     
     // Start view builder
-    store.start_view_builder::<BankLiquidityView>().await?;
+    store.start_view_builder::<BankLiquidityView>(None).await?;
     
     tracing::info!("Starting liquidity view test...");
     
@@ -174,7 +175,7 @@ async fn test_view_query_pagination() -> Result<(), anyhow::Error> {
     let store = Arc::new(create_test_store().await?);
     
     // Start view builder
-    store.start_view_builder::<BankAccountView>().await?;
+    store.start_view_builder::<BankAccountView>(None).await?;
     
     // Generate unique user IDs
     let user_id1 = Uuid::new_v4().to_string();

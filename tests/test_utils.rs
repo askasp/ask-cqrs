@@ -2,12 +2,12 @@ use sqlx::postgres::PgPool;
 use anyhow::Result;
 use tracing_subscriber;
 
-pub async fn create_test_store() -> Result<ask_cqrs::postgres_store::PostgresStore> {
+pub async fn create_test_store() -> Result<ask_cqrs::store::postgres_event_store::PostgresEventStore> {
     // First connect to the database
     let pool = PgPool::connect("postgres://postgres:postgres@localhost:5432/ask_cqrs_test2").await?;
     
-    // Stop all view builders and event handlers by removing their subscriptions
-    sqlx::query("DELETE FROM persistent_subscriptions")
+    // Clear event processing claims
+    sqlx::query("DELETE FROM event_processing_claims")
         .execute(&pool)
         .await?;
 
@@ -15,22 +15,22 @@ pub async fn create_test_store() -> Result<ask_cqrs::postgres_store::PostgresSto
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
     
     // Terminate all existing connections to ensure clean slate
-    sqlx::query("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'ask_cqrs_test' AND pid <> pg_backend_pid()")
+    sqlx::query("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'ask_cqrs_test2' AND pid <> pg_backend_pid()")
         .execute(&pool)
         .await?;
 
     // Wait for connections to be terminated
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
-    // Truncate all tables
+    // Truncate all tables including dead_letter_events
     sqlx::query(
-        "TRUNCATE TABLE events, view_snapshots, persistent_subscriptions RESTART IDENTITY CASCADE"
+        "TRUNCATE TABLE events, view_snapshots, event_processing_claims, dead_letter_events RESTART IDENTITY CASCADE"
     )
     .execute(&pool)
     .await?;
 
     // Create and return the store with a fresh connection - using the same database name
-    let store = ask_cqrs::postgres_store::PostgresStore::new("postgres://postgres:postgres@localhost:5432/ask_cqrs_test2").await?;
+    let store = ask_cqrs::store::postgres_event_store::PostgresEventStore::new("postgres://postgres:postgres@localhost:5432/ask_cqrs_test2").await?;
     
     // Wait longer to ensure store is fully initialized
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
