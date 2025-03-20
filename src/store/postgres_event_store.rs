@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow};
 use sqlx::{postgres::{PgPool, PgListener}, postgres::PgRow, Row, Executor, PgExecutor, FromRow};
 use uuid::Uuid;
-use tracing::{info, warn, error, debug, instrument};
+use tracing::{info, warn, error, debug, instrument, Span, trace, info_span};
 use tokio::sync::broadcast;
 use serde_json::{self, Value as JsonValue, json};
 use chrono::{DateTime, Utc};
@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use tokio::task::JoinHandle;
 use serde::de::DeserializeOwned;
+use tracing::Instrument;
 
 use crate::{
     store::event_store::{
@@ -376,11 +377,14 @@ impl PostgresEventStore {
                 stream_name, stream_id, handler_name
             );
             
+            // The failed position is the one AFTER the last successfully processed position
+            let failed_position = claim.last_position + 1;
+            
             if let Err(e) = self.move_to_dead_letter_queue(
                 stream_name,
                 stream_id,
                 handler_name,
-                claim.last_position,
+                failed_position,
                 error,
                 error_count
             ).await {
@@ -500,19 +504,25 @@ impl PostgresEventStore {
         H: EventHandler + Send + Sync,
     {
         tracing::debug!(
-            "Processing events for handler '{}' stream '{}/{}' from position {}",
-            H::name(), stream_name, stream_id, last_position
+            handler = %H::name(),
+            stream_name = %stream_name,
+            stream_id = %stream_id,
+            last_position = last_position,
+            "Processing events for handler"
         );
         
         // Get events for this stream that need processing
+        let fetch_span = info_span!("fetch_events", after_position = last_position, batch_size = config.batch_size);
+        let _fetch_guard = fetch_span.enter();
         let events = self.get_events_for_stream(
             stream_name,
             stream_id,
             last_position,
             config.batch_size,
         ).await?;
+        drop(_fetch_guard);
         
-        tracing::debug!("Found {} events to process for handler '{}'", events.len(), H::name());
+        tracing::debug!(event_count = events.len(), "Found events to process for handler");
         
         if events.is_empty() {
             return Ok(last_position);
@@ -523,16 +533,17 @@ impl PostgresEventStore {
         // Process each event in order
         for event in events {
             let position = event.stream_position;
-            
-            tracing::debug!(
-                "Processing event: stream={}/{}, position={}, global_position={}, handler={}",
-                event.stream_name, event.stream_id, event.stream_position, 
-                event.global_position, H::name()
+            let event_span = info_span!(
+                "handle_event", 
+                stream_position = position, 
+                global_position = event.global_position,
+                event_id = %event.id
             );
             
             // Try to deserialize and handle the event
             match serde_json::from_value::<H::Events>(event.event_data.clone()) {
                 Ok(typed_event) => {
+                    let _guard = event_span.enter();
                     if let Err(e) = handler.handle_event(typed_event, event.clone()).await {
                         return Err(anyhow!(e.log_message));
                     }
@@ -540,17 +551,17 @@ impl PostgresEventStore {
                     max_position = position;
                 },
                 Err(e) => {
-                    tracing::error!(
-                        "Error deserializing event: stream={}/{}, position={}, error={}", 
-                        stream_name, stream_id, position, e
+                    error!(
+                        error = %e,
+                        "Error deserializing event"
                     );
                 }
             }
         }
         
         tracing::debug!(
-            "Processed events for handler '{}' stream '{}/{}' up to position {}",
-            H::name(), stream_name, stream_id, max_position
+            new_position = max_position,
+            "Processed events for handler"
         );
         
         Ok(max_position)
@@ -906,11 +917,25 @@ impl EventStore for PostgresEventStore {
         let stream_id = command.stream_id();
         info!("Executing command for stream: {}", stream_id);
         let stream_name = A::name();
+        
+        let build_state_span = info_span!("build_aggregate_state", stream_name = %stream_name, stream_id = %stream_id);
+        let _build_guard = build_state_span.enter();
         let (state, last_position) = self.build_state::<A>(&stream_id).await?;
+        drop(_build_guard);
+        
+        trace!(last_position, "Current aggregate state built");
+        
+        let execute_span = info_span!("execute_aggregate_logic");
+        let _execute_guard = execute_span.enter();
         let events = A::execute(&state, &command, &stream_id, service)?;
+        drop(_execute_guard);
+        
+        trace!(event_count = events.len(), "Command generated events");
 
-        let stream_name = A::name();
         let next_position = last_position.unwrap_or(-1) + 1;
+        
+        let store_span = info_span!("store_events", next_position = next_position, event_count = events.len());
+        let _store_guard = store_span.enter();
 
         let mut tx = self.pool.begin().await?;
         let mut final_global_position = 0;
@@ -919,6 +944,14 @@ impl EventStore for PostgresEventStore {
             let event_json = serde_json::to_value(&event)?;
             let stream_position = next_position + idx as i64;
             let id = Uuid::new_v4();
+            
+            let event_span = info_span!(
+                "store_event", 
+                event_id = %id,
+                event_type = %event_json["type"].as_str().unwrap_or("unknown"),
+                stream_position = stream_position
+            );
+            let _event_guard = event_span.enter();
 
             let row = sqlx::query(
                 r#"
@@ -937,6 +970,7 @@ impl EventStore for PostgresEventStore {
             .await?;
 
             final_global_position = row.get("global_position");
+            trace!(global_position = final_global_position, "Event stored");
         }
 
         // Notify listeners of new events
@@ -946,6 +980,11 @@ impl EventStore for PostgresEventStore {
             .await?;
             
         tx.commit().await?;
+        
+        info!(
+            global_position = final_global_position,
+            "Command executed successfully"
+        );
 
         Ok(CommandResult {
             stream_id,
@@ -953,12 +992,13 @@ impl EventStore for PostgresEventStore {
         })
     }
     
-    #[instrument(skip(self))]
     async fn build_state<A: Aggregate>(
         &self,
         stream_id: &str,
     ) -> Result<(Option<A::State>, Option<i64>)> {
         let stream_name = A::name();
+        
+        debug!("Building aggregate state for {}/{}", stream_name, stream_id);
         
         let rows = sqlx::query(
             "SELECT event_data, stream_position 
@@ -973,13 +1013,28 @@ impl EventStore for PostgresEventStore {
 
         let mut state = None;
         let mut last_position = None;
+        
+        trace!(event_count = rows.len(), "Retrieved events for rebuilding state");
 
-        for row in rows {
+        for (idx, row) in rows.iter().enumerate() {
+            let position: i64 = row.get("stream_position");
+            Span::current().record("current_position", position);
+            
             if let Ok(event) = serde_json::from_value(row.get("event_data")) {
+                let event_span = info_span!("apply_event", position = position, event_index = idx);
+                let _guard = event_span.enter();
+                
                 A::apply_event(&mut state, &event);
-                last_position = Some(row.get("stream_position"));
+                last_position = Some(position);
+                
+                trace!("Applied event to state");
             }
         }
+        
+        debug!(
+            last_position = last_position.unwrap_or(-1),
+            "Finished building aggregate state"
+        );
 
         Ok((state, last_position))
     }
@@ -1010,6 +1065,9 @@ impl EventStore for PostgresEventStore {
         
         // THREAD 1: Continuously look for streams to claim
         tokio::spawn(async move {
+            let span = info_span!("claim_thread", handler = %handler_name_claim, node_id = %store_claim.node_id);
+            let _guard = span.enter();
+            
             info!("Starting claim thread for handler: {}", handler_name_claim);
             loop {
                 // Break on shutdown signal
@@ -1018,6 +1076,8 @@ impl EventStore for PostgresEventStore {
                     break;
                 }
                 
+                let claim_span = info_span!("find_and_claim_streams", handler = %handler_name_claim);
+                let _claim_guard = claim_span.enter();
                 match store_claim.find_and_claim_streams(&handler_name_claim, &config_claim).await {
                     Ok(claimed) => {
                         if claimed > 0 {
@@ -1028,6 +1088,7 @@ impl EventStore for PostgresEventStore {
                         error!("Error claiming streams for handler {}: {}", handler_name_claim, e);
                     }
                 }
+                drop(_claim_guard);
                 
                 // Wait for notification or timeout
                 tokio::select! {
@@ -1043,6 +1104,9 @@ impl EventStore for PostgresEventStore {
         
         // THREAD 2: Process streams that are already claimed by this node
         tokio::spawn(async move {
+            let span = info_span!("process_thread", handler = %handler_name_process, node_id = %store_process.node_id);
+            let _guard = span.enter();
+            
             info!("Starting process thread for handler: {}", handler_name_process);
             loop {
                 // Break on shutdown signal
@@ -1051,6 +1115,8 @@ impl EventStore for PostgresEventStore {
                     break;
                 }
                 
+                let process_span = info_span!("process_claimed_streams", handler = %handler_name_process);
+                let _process_guard = process_span.enter();
                 match store_process.process_claimed_streams(&handler_clone, &config_process).await {
                     Ok(processed) => {
                         if processed > 0 {
@@ -1061,6 +1127,7 @@ impl EventStore for PostgresEventStore {
                         error!("Error processing claimed streams for handler {}: {}", handler_name_process, e);
                     }
                 }
+                drop(_process_guard);
                 
                 // Sleep briefly to avoid tight loop
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1151,6 +1218,17 @@ impl EventStore for PostgresEventStore {
         .await?
         .ok_or_else(|| anyhow!("Dead letter event not found: {}", dead_letter_id))?;
         
+        let stream_name = dead_letter.get::<String, _>("stream_name");
+        let stream_id = dead_letter.get::<String, _>("stream_id");
+        let handler_name = dead_letter.get::<String, _>("handler_name");
+        let position = dead_letter.get::<i64, _>("stream_position");
+        
+        Span::current()
+            .record("stream_name", &stream_name.as_str())
+            .record("stream_id", &stream_id.as_str())
+            .record("handler_name", &handler_name.as_str())
+            .record("stream_position", &position);
+        
         // Verify the original event still exists
         let original_event = sqlx::query(
             r#"
@@ -1158,9 +1236,9 @@ impl EventStore for PostgresEventStore {
             WHERE stream_name = $1 AND stream_id = $2 AND stream_position = $3
             "#
         )
-        .bind(dead_letter.get::<String, _>("stream_name"))
-        .bind(dead_letter.get::<String, _>("stream_id"))
-        .bind(dead_letter.get::<i64, _>("stream_position"))
+        .bind(&stream_name)
+        .bind(&stream_id)
+        .bind(position)
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| anyhow!("Original event no longer exists"))?;
@@ -1183,10 +1261,10 @@ impl EventStore for PostgresEventStore {
                 handler_name = $4
             "#
         )
-        .bind(dead_letter.get::<i64, _>("stream_position"))
-        .bind(dead_letter.get::<String, _>("stream_name"))
-        .bind(dead_letter.get::<String, _>("stream_id"))
-        .bind(dead_letter.get::<String, _>("handler_name"))
+        .bind(position)
+        .bind(&stream_name)
+        .bind(&stream_id)
+        .bind(&handler_name)
         .execute(&mut *tx)
         .await?;
         
@@ -1199,7 +1277,7 @@ impl EventStore for PostgresEventStore {
         // Commit the transaction
         tx.commit().await?;
         
-        info!("Replayed dead letter event: {}", dead_letter_id);
+        info!("Replayed dead letter event");
         
         // Notify of a new event to trigger processing
         sqlx::query("SELECT pg_notify('new_event', '0')")

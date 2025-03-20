@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow};
 use sqlx::{postgres::PgPool, Row};
-use tracing::{info, error, debug};
+use tracing::{info, error, debug, instrument, Span, trace, info_span};
 use serde_json::{self, Value as JsonValue, json};
 use uuid::Uuid;
 use tokio::time::sleep;
@@ -61,6 +61,9 @@ impl ViewStore for PostgresViewStore {
     }
     
     async fn get_view_state<V: View>(&self, partition_key: &str) -> Result<Option<V>> {
+        let view_span = info_span!("get_view_state", view_name = %V::name(), partition_key = %partition_key);
+        let _guard = view_span.enter();
+        
         let row = sqlx::query(
             "SELECT state, last_processed_global_position, processed_stream_positions
              FROM view_snapshots 
@@ -74,12 +77,11 @@ impl ViewStore for PostgresViewStore {
         match row {
             Some(row) => {
                 let position: i64 = row.get("last_processed_global_position");
-                debug!("Retrieved view {} partition {} at global position {}", 
-                       V::name(), partition_key, position);
+                debug!(global_position = position, "Retrieved view state");
                 Ok(Some(serde_json::from_value(row.get("state"))?))
             },
             None => {
-                debug!("View {} partition {} not found", V::name(), partition_key);
+                debug!("View state not found");
                 Ok(None)
             }
         }
@@ -90,8 +92,21 @@ impl ViewStore for PostgresViewStore {
         partition_key: &str,
         event_row: &EventRow,
     ) -> Result<bool> {
+        let span = info_span!(
+            "is_event_processed", 
+            view_name = %V::name(),
+            partition_key = %partition_key,
+            stream_name = %event_row.stream_name,
+            stream_id = %event_row.stream_id,
+            stream_position = event_row.stream_position,
+            global_position = event_row.global_position
+        );
+        let _guard = span.enter();
+        
         // Create a unique key for this stream
         let stream_key = Self::get_stream_key(&event_row.stream_name, &event_row.stream_id);
+        
+        trace!(stream_key = %stream_key, "Checking if event is already processed");
         
         // Check if we have already processed this event for this stream
         let row = sqlx::query(
@@ -111,14 +126,17 @@ impl ViewStore for PostgresViewStore {
                 if let Ok(last_position) = position_str.parse::<i64>() {
                     // If the event's position is less than or equal to what we've already processed, skip it
                     if event_row.stream_position <= last_position {
-                        debug!("Skipping already processed event for {}/{}: event pos={}, last processed={}",
-                              event_row.stream_name, event_row.stream_id, event_row.stream_position, last_position);
+                        debug!(
+                            last_processed_position = last_position,
+                            "Event already processed"
+                        );
                         return Ok(true);
                     }
                 }
             }
         }
         
+        debug!("Event not yet processed");
         Ok(false)
     }
     
@@ -128,9 +146,26 @@ impl ViewStore for PostgresViewStore {
         view: &V,
         event_row: &EventRow,
     ) -> Result<()> {
+        let span = info_span!(
+            "save_view_state",
+            view_name = %V::name(),
+            partition_key = %partition_key,
+            stream_name = %event_row.stream_name,
+            stream_id = %event_row.stream_id,
+            stream_position = event_row.stream_position,
+            global_position = event_row.global_position
+        );
+        let _guard = span.enter();
+        
         let state_json = serde_json::to_value(view)?;
         let id = Uuid::new_v4().to_string();
         let stream_key = Self::get_stream_key(&event_row.stream_name, &event_row.stream_id);
+        
+        trace!(
+            id = %id,
+            stream_key = %stream_key,
+            "Saving view state"
+        );
         
         // We need to update the processed_stream_positions object with the new stream position
         // Using PostgreSQL's jsonb_set function for this
@@ -157,6 +192,7 @@ impl ViewStore for PostgresViewStore {
         .execute(&self.pool)
         .await?;
 
+        debug!("View state saved successfully");
         Ok(())
     }
     
@@ -166,6 +202,13 @@ impl ViewStore for PostgresViewStore {
         params: Vec<JsonValue>,
         pagination: Option<PaginationOptions>,
     ) -> Result<PaginatedResult<V>> {
+        let span = info_span!(
+            "query_views",
+            view_name = %V::name(),
+            condition = %condition
+        );
+        let _guard = span.enter();
+        
         // First get total count
         let view_name = V::name();
         let count_query = format!(
@@ -184,7 +227,10 @@ impl ViewStore for PostgresViewStore {
         let count_row = count_builder.fetch_one(&self.pool).await?;
         let total_count: i64 = count_row.get("count");
 
+        trace!(total_count, "Query count result");
+
         if total_count == 0 {
+            debug!("No views found matching condition");
             return Ok(PaginatedResult {
                 items: vec![],
                 total_count: 0,
@@ -195,6 +241,10 @@ impl ViewStore for PostgresViewStore {
 
         // Add pagination if provided
         let (query, page, page_size) = if let Some(ref pagination) = pagination {
+            Span::current()
+                .record("page", pagination.page)
+                .record("page_size", pagination.page_size);
+                
             (
                 format!(
                     "SELECT partition_key, state 
@@ -238,12 +288,20 @@ impl ViewStore for PostgresViewStore {
         }
 
         let rows = query_builder.fetch_all(&self.pool).await?;
-
+        let result_count = rows.len();
+        
         let mut items = Vec::with_capacity(rows.len());
         for row in rows {
             let view: V = serde_json::from_value(row.get("state"))?;
             items.push(view);
         }
+
+        debug!(
+            found_items = result_count, 
+            total_count, 
+            page, 
+            "Query executed successfully"
+        );
 
         Ok(PaginatedResult {
             items,
@@ -254,36 +312,73 @@ impl ViewStore for PostgresViewStore {
     }
     
     async fn get_view_by_user_id<V: View>(&self, user_id: &str) -> Result<Option<V>> {
+        let query_span = info_span!("query_views_by_user_id", user_id = %user_id, view_name = %V::name());
+        let _guard = query_span.enter();
+        
         let res = self.query_views::<V>(
             "state->>'user_id' = ($2#>>'{}')::text",
             vec![json!(user_id)],
             None,
         ).await?;
-        Ok(res.items.first().cloned())
+        
+        if !res.items.is_empty() {
+            debug!("Found view for user");
+            Ok(res.items.first().cloned())
+        } else {
+            debug!("No view found for user");
+            Ok(None)
+        }
     }
     
     async fn get_views_by_user_id<V: View>(&self, user_id: &str) -> Result<Vec<V>> {
+        let query_span = info_span!("query_views_by_user_id", user_id = %user_id, view_name = %V::name());
+        let _guard = query_span.enter();
+        
         let res = self.query_views::<V>(
             "state->>'user_id' = ($2#>>'{}')::text",
             vec![json!(user_id)],
             None,
         ).await?;
+        
+        debug!(count = res.items.len(), "Retrieved views for user");
         Ok(res.items)
     }
     
     async fn get_all_views<V: View>(&self) -> Result<Vec<V>> {
+        let query_span = info_span!("query_all_views", view_name = %V::name());
+        let _guard = query_span.enter();
+        
         let res = self.query_views::<V>("true", vec![], None).await?;
+        
+        debug!(count = res.items.len(), "Retrieved all views");
         Ok(res.items)
     }
     
-    async fn wait_for_view<V: View + Default>(&self, partition_key: &str, target_position: i64, timeout_ms: u64) -> Result<()> {
+    async fn wait_for_view<V: View + Default>(
+        &self, 
+        partition_key: &str, 
+        target_position: i64, 
+        timeout_ms: u64
+    ) -> Result<()> {
+        let span = info_span!(
+            "wait_for_view",
+            view_name = %V::name(),
+            partition_key = %partition_key,
+            target_position = target_position,
+            timeout_ms = timeout_ms
+        );
+        let _guard = span.enter();
+        
         let start = Instant::now();
         let timeout = Duration::from_millis(timeout_ms);
         let view_name = V::name();
         
-        info!("Waiting for view {view_name} partition {partition_key} to reach position {target_position}");
+        info!("Waiting for view to reach position");
         
         loop {
+            let elapsed = start.elapsed();
+            Span::current().record("elapsed_ms", elapsed.as_millis() as i64);
+            
             // Check if the view has processed up to our target position
             let row = sqlx::query(
                 "SELECT last_processed_global_position 
@@ -298,12 +393,16 @@ impl ViewStore for PostgresViewStore {
             // Return success if target position has been reached
             if let Some(row) = row {
                 let last_position: i64 = row.get("last_processed_global_position");
+                Span::current().record("current_position", last_position);
+                
                 if last_position >= target_position {
-                    info!("View {view_name} partition {partition_key} reached target position {target_position}");
+                    info!(current_position = last_position, "View reached target position");
                     return Ok(());
                 }
+                
+                trace!(current_position = last_position, "View not yet at target position");
             } else {
-                debug!("View {view_name} partition {partition_key} not found yet");
+                debug!("View not found yet");
             }
 
             // Check for timeout
@@ -315,7 +414,12 @@ impl ViewStore for PostgresViewStore {
                     .await?
                     .is_some();
                 
-                error!("Timeout waiting for view {view_name} partition {partition_key} to reach position {target_position}. Target event exists: {event_exists}");
+                Span::current().record("event_exists", event_exists);
+                
+                error!(
+                    elapsed_ms = start.elapsed().as_millis() as i64,
+                    "Timeout waiting for view to catch up"
+                );
                 return Err(anyhow!("Timeout waiting for view to catch up"));
             }
 
