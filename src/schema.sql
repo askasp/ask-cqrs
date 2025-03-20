@@ -16,16 +16,6 @@ CREATE INDEX IF NOT EXISTS idx_events_global_position ON events(global_position)
 CREATE INDEX IF NOT EXISTS idx_events_stream ON events(stream_name);
 CREATE INDEX IF NOT EXISTS idx_events_stream_id ON events(stream_id);
 
--- Persistent subscriptions for tracking event processing progress
-CREATE TABLE IF NOT EXISTS persistent_subscriptions (
-    id UUID PRIMARY KEY,
-    name TEXT NOT NULL,
-    consumer_group TEXT NOT NULL,
-    last_processed_position BIGINT DEFAULT 0,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(name, consumer_group)
-);
-
 -- Notification function and trigger for new events
 CREATE OR REPLACE FUNCTION notify_new_event() RETURNS TRIGGER AS $$
 BEGIN
@@ -53,4 +43,26 @@ CREATE TABLE IF NOT EXISTS view_snapshots (
 );
 
 -- Index for efficient view snapshot lookups
-CREATE INDEX IF NOT EXISTS idx_view_snapshots_lookup ON view_snapshots(view_name, partition_key); 
+CREATE INDEX IF NOT EXISTS idx_view_snapshots_lookup ON view_snapshots(view_name, partition_key);
+
+-- Event processing claims for competing consumers - Enhanced to handle all state
+CREATE TABLE IF NOT EXISTS event_processing_claims (
+    id TEXT PRIMARY KEY,
+    stream_name TEXT NOT NULL,
+    stream_id TEXT NOT NULL,
+    handler_name TEXT NOT NULL,
+    last_position BIGINT NOT NULL,
+    claimed_by TEXT,
+    claim_expires_at TIMESTAMP WITH TIME ZONE,
+    error_count INT NOT NULL DEFAULT 0,
+    last_error TEXT,
+    next_retry_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    last_updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(stream_name, stream_id, handler_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_event_claims_handler ON event_processing_claims(handler_name);
+CREATE INDEX IF NOT EXISTS idx_event_claims_stream ON event_processing_claims(stream_name, stream_id);
+CREATE INDEX IF NOT EXISTS idx_event_claims_expires ON event_processing_claims(claim_expires_at);
+CREATE INDEX IF NOT EXISTS idx_event_claims_retry ON event_processing_claims(next_retry_at); 

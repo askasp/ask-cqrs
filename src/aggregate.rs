@@ -13,9 +13,9 @@ use crate::command::DomainCommand;
 #[async_trait]
 pub trait Aggregate {
     type Event: DeserializeOwned + Serialize + Send + Sync;
-    type Command: DomainCommand;
+    type Command: DomainCommand + Send + Sync;
     type DomainError:  Error + Send + Sync + 'static;
-    type State: Debug;
+    type State: Debug + Send + Sync;
     type Service: Clone + Send + Sync;
 
     fn name() -> &'static str;

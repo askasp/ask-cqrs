@@ -16,6 +16,7 @@ use view::{View};
  pub mod event_handler;
  pub mod view;
  pub mod postgres_store;
+pub mod store;
 
  use command::DomainCommand;
 
