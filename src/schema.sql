@@ -66,3 +66,21 @@ CREATE INDEX IF NOT EXISTS idx_event_claims_handler ON event_processing_claims(h
 CREATE INDEX IF NOT EXISTS idx_event_claims_stream ON event_processing_claims(stream_name, stream_id);
 CREATE INDEX IF NOT EXISTS idx_event_claims_expires ON event_processing_claims(claim_expires_at);
 CREATE INDEX IF NOT EXISTS idx_event_claims_retry ON event_processing_claims(next_retry_at); 
+
+-- Dead letter queue for permanently failed events
+CREATE TABLE IF NOT EXISTS dead_letter_events (
+    id TEXT PRIMARY KEY,
+    event_id TEXT NOT NULL,
+    stream_name TEXT NOT NULL,
+    stream_id TEXT NOT NULL,
+    handler_name TEXT NOT NULL,
+    error_message TEXT NOT NULL,
+    retry_count INT NOT NULL,
+    event_data JSONB NOT NULL,
+    stream_position BIGINT NOT NULL,
+    dead_lettered_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Indexes for efficient dead letter queue access
+CREATE INDEX IF NOT EXISTS idx_dead_letter_stream ON dead_letter_events(stream_name, stream_id);
+CREATE INDEX IF NOT EXISTS idx_dead_letter_handler ON dead_letter_events(handler_name);

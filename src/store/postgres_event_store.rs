@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use crate::{
     store::event_store::{
         EventStore, CommandResult, EventProcessingConfig, PaginationOptions, PaginatedResult,
+        DeadLetterEvent,
     },
     store::stream_claim::StreamClaim,
     aggregate::Aggregate,
@@ -270,6 +271,23 @@ impl PostgresEventStore {
         let next_retry_at = if error_count <= config.max_retries {
             Some(Self::calculate_next_retry_time(error_count, config))
         } else {
+            // No more retries - move to dead letter queue
+            info!(
+                "Max retries exceeded for stream {}/{}, handler {}. Moving to dead letter queue.",
+                stream_name, stream_id, handler_name
+            );
+            
+            if let Err(e) = self.move_to_dead_letter_queue(
+                stream_name,
+                stream_id,
+                handler_name,
+                claim.last_position,
+                error,
+                error_count
+            ).await {
+                error!("Failed to move event to dead letter queue: {}", e);
+            }
+            
             // No more retries
             None
         };
@@ -301,6 +319,72 @@ impl PostgresEventStore {
         .execute(&self.pool)
         .await?;
 
+        Ok(())
+    }
+    
+    /// Move a failed event to the dead letter queue
+    async fn move_to_dead_letter_queue(
+        &self,
+        stream_name: &str,
+        stream_id: &str,
+        handler_name: &str,
+        position: i64,
+        error: &str,
+        retry_count: i32
+    ) -> Result<()> {
+        // Get the event at the specified position
+        let event_row = sqlx::query(
+            r#"
+            SELECT 
+                id, stream_name, stream_id, event_data, metadata, stream_position, global_position, created_at
+            FROM events 
+            WHERE 
+                stream_name = $1 AND 
+                stream_id = $2 AND 
+                stream_position = $3
+            "#
+        )
+        .bind(stream_name)
+        .bind(stream_id)
+        .bind(position)
+        .fetch_optional(&self.pool)
+        .await?;
+        
+        // If event exists, move it to the dead letter queue
+        if let Some(row) = event_row {
+            let id = Uuid::new_v4().to_string();
+            
+            sqlx::query(
+                r#"
+                INSERT INTO dead_letter_events
+                (id, event_id, stream_name, stream_id, handler_name, error_message, 
+                 retry_count, event_data, stream_position, dead_lettered_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
+                "#
+            )
+            .bind(&id)
+            .bind(row.get::<String, _>("id"))
+            .bind(stream_name)
+            .bind(stream_id)
+            .bind(handler_name)
+            .bind(error)
+            .bind(retry_count)
+            .bind(row.get::<JsonValue, _>("event_data"))
+            .bind(position)
+            .execute(&self.pool)
+            .await?;
+            
+            info!(
+                "Event moved to dead letter queue: id={}, stream={}/{}, position={}, handler={}",
+                id, stream_name, stream_id, position, handler_name
+            );
+        } else {
+            warn!(
+                "Could not find event to move to dead letter queue: stream={}/{}, position={}",
+                stream_name, stream_id, position
+            );
+        }
+        
         Ok(())
     }
 
@@ -559,6 +643,20 @@ impl PostgresEventStore {
         let view_name = V::name();
         let view = V::default();
 
+        // Get the latest global position to start from
+        let starting_position = match sqlx::query("SELECT COALESCE(MAX(global_position), -1) as pos FROM events")
+            .fetch_one(&self.pool)
+            .await
+        {
+            Ok(row) => row.get::<i64, _>("pos"),
+            Err(e) => {
+                error!("Failed to get latest event position: {}", e);
+                -1
+            }
+        };
+
+        info!("Starting view builder for {} from position {}", view_name, starting_position);
+        
         // Start listener for new events
         let mut listener = PgListener::connect_with(&self.pool).await?;
         listener.listen("new_event").await?;
@@ -567,47 +665,34 @@ impl PostgresEventStore {
         let store = self.clone();
         let mut shutdown = self.shutdown.subscribe();
         
+        // Process all events first (this will initialize all partitions)
+        let store_clone = store.clone();
+        let config_clone = config.clone();
+        let view_clone = view.clone();
+        
         tokio::spawn(async move {
+            // Initial processing of all events
+            if let Err(e) = store_clone.process_all_view_events::<V>(&view_clone, -1, &config_clone).await {
+                error!("Error in initial view processing: {}", e);
+            }
+            
             let poll_interval = Duration::from_secs(5);
             
             loop {
                 tokio::select! {
                     // Wait for new event notification
                     Ok(_) = listener.recv() => {
-                        // When new event arrives, check all partitions
-                        if let Ok(partitions) = store.get_view_partitions::<V>().await {
-                            for partition_key in partitions {
-                                let position = match store.get_view_last_position::<V>(&partition_key).await {
-                                    Ok(pos) => pos.unwrap_or(-1),
-                                    Err(e) => {
-                                        error!("Error getting view position for {}: {}", partition_key, e);
-                                        continue;
-                                    }
-                                };
-                                
-                                if let Err(e) = store.process_view_events::<V>(&view, &partition_key, position, &config).await {
-                                    error!("Error processing view events for {}: {}", partition_key, e);
-                                }
-                            }
+                        // When new event arrives, process all events
+                        if let Err(e) = store.process_all_view_events::<V>(&view, -1, &config).await {
+                            error!("Error processing view events: {}", e);
                         }
                     }
                     
                     // Periodic poll for updates
                     _ = sleep(poll_interval) => {
-                        if let Ok(partitions) = store.get_view_partitions::<V>().await {
-                            for partition_key in partitions {
-                                let position = match store.get_view_last_position::<V>(&partition_key).await {
-                                    Ok(pos) => pos.unwrap_or(-1),
-                                    Err(e) => {
-                                        error!("Error getting view position for {}: {}", partition_key, e);
-                                        continue;
-                                    }
-                                };
-                                
-                                if let Err(e) = store.process_view_events::<V>(&view, &partition_key, position, &config).await {
-                                    error!("Error processing view events for {}: {}", partition_key, e);
-                                }
-                            }
+                        // Check for any new events periodically
+                        if let Err(e) = store.process_all_view_events::<V>(&view, -1, &config).await {
+                            error!("Error processing view events: {}", e);
                         }
                     }
                     
@@ -618,6 +703,123 @@ impl PostgresEventStore {
         });
 
         Ok(())
+    }
+    
+    /// Process all events for a view regardless of partition
+    async fn process_all_view_events<V>(
+        &self,
+        view: &V,
+        force_position: i64,
+        config: &EventProcessingConfig,
+    ) -> Result<i64>
+    where
+        V: View + Send + Sync,
+    {
+        // When force_position is provided, use that, otherwise get the highest global position from any
+        // existing view snapshots to avoid reprocessing
+        let last_position = if force_position >= 0 {
+            force_position
+        } else {
+            // Get max position from view snapshots
+            let max_pos_query = sqlx::query(
+                r#"
+                SELECT COALESCE(MAX(last_event_position), -1) as max_pos
+                FROM view_snapshots
+                WHERE view_name = $1
+                "#
+            )
+            .bind(V::name())
+            .fetch_one(&self.pool)
+            .await?;
+            
+            max_pos_query.get::<i64, _>("max_pos")
+        };
+
+        let rows = sqlx::query(
+            r#"
+            SELECT 
+                id, stream_name, stream_id, event_data, metadata, stream_position, global_position, created_at
+            FROM events 
+            WHERE global_position > $1
+            ORDER BY global_position
+            LIMIT $2
+            "#
+        )
+        .bind(last_position)
+        .bind(config.batch_size)
+        .fetch_all(&self.pool)
+        .await?;
+
+        if rows.is_empty() {
+            return Ok(last_position);
+        }
+
+        let mut final_position = last_position;
+        let mut updated_partitions = std::collections::HashSet::new();
+        
+        for row in rows {
+            if let Ok(event) = serde_json::from_value::<V::Event>(row.get("event_data")) {
+                let event_row = EventRow {
+                    id: row.get("id"),
+                    stream_name: row.get("stream_name"),
+                    stream_id: row.get("stream_id"),
+                    event_data: row.get("event_data"),
+                    metadata: row.get("metadata"),
+                    stream_position: row.get("stream_position"),
+                    global_position: row.get("global_position"),
+                    created_at: row.get("created_at"),
+                };
+
+                if let Some(pk) = V::get_partition_key(&event, &event_row) {
+                    // Get the latest position for this partition
+                    let partition_position = match sqlx::query(
+                        r#"
+                        SELECT last_event_position
+                        FROM view_snapshots
+                        WHERE view_name = $1 AND partition_key = $2
+                        "#
+                    )
+                    .bind(V::name())
+                    .bind(&pk)
+                    .fetch_optional(&self.pool)
+                    .await? {
+                        Some(row) => row.get::<i64, _>("last_event_position"),
+                        None => -1
+                    };
+                    
+                    // Only process if this event is newer than what the partition has seen
+                    if event_row.global_position > partition_position {
+                        // Get or initialize view state
+                        let mut view_state = match self.get_view_state::<V>(&pk).await? {
+                            Some(state) => state,
+                            None => match V::initialize(&event, &event_row) {
+                                Some(new_view) => new_view,
+                                None => {
+                                    error!("Failed to initialize view for {}", pk);
+                                    continue; // Skip this event and try the next one
+                                }
+                            },
+                        };
+                        
+                        // Apply the event
+                        view_state.apply_event(&event, &event_row);
+                        
+                        // Save updated view state
+                        self.save_view_state::<V>(&pk, &view_state, event_row.global_position).await?;
+                        
+                        updated_partitions.insert(pk);
+                    }
+                }
+                
+                final_position = event_row.global_position;
+            }
+        }
+
+        if !updated_partitions.is_empty() {
+            info!("Updated {} partitions for view {}", updated_partitions.len(), V::name());
+        }
+
+        Ok(final_position)
     }
 
     /// Get the last processed position for a view
@@ -1088,9 +1290,14 @@ impl EventStore for PostgresEventStore {
         })
     }
     
-    async fn wait_for_view<V: View>(&self, partition_key: &str, target_position: i64, timeout_ms: u64) -> Result<()> {
+    async fn wait_for_view<V: View + Default>(&self, partition_key: &str, target_position: i64, timeout_ms: u64) -> Result<()> {
         let start = Instant::now();
         let timeout = Duration::from_millis(timeout_ms);
+        let view = V::default();
+        let config = EventProcessingConfig::default();
+        
+        // Try to process events immediately to ensure the view is created and up to date
+        self.process_all_view_events::<V>(&view, -1, &config).await?;
 
         loop {
             let row = sqlx::query(
@@ -1109,6 +1316,9 @@ impl EventStore for PostgresEventStore {
                     return Ok(());
                 }
             }
+
+            // Try processing again in case we missed something - force position -1 to check all events
+            self.process_all_view_events::<V>(&view, -1, &config).await?;
 
             if start.elapsed() > timeout {
                 return Err(anyhow!("Timeout waiting for view to catch up"));
@@ -1139,5 +1349,167 @@ impl EventStore for PostgresEventStore {
     async fn get_all_views<V: View>(&self) -> Result<Vec<V>> {
         let res = self.query_views::<V>("true", vec![], None).await?;
         Ok(res.items)
+    }
+    
+    async fn get_dead_letter_events(&self, page: i64, page_size: i32) -> Result<PaginatedResult<DeadLetterEvent>> {
+        // Get total count first
+        let count_row = sqlx::query("SELECT COUNT(*) FROM dead_letter_events")
+            .fetch_one(&self.pool)
+            .await?;
+            
+        let total_count: i64 = count_row.get(0);
+        
+        if total_count == 0 {
+            return Ok(PaginatedResult {
+                items: Vec::new(),
+                total_count: 0,
+                page,
+                total_pages: 0,
+            });
+        }
+        
+        // Calculate pagination
+        let offset = page * page_size as i64;
+        let total_pages = (total_count as f64 / page_size as f64).ceil() as i64;
+        
+        // Fetch paginated results
+        let rows = sqlx::query(
+            r#"
+            SELECT 
+                id, event_id, stream_name, stream_id, handler_name,
+                error_message, retry_count, event_data, stream_position, dead_lettered_at
+            FROM dead_letter_events
+            ORDER BY dead_lettered_at DESC
+            LIMIT $1 OFFSET $2
+            "#
+        )
+        .bind(page_size)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+        
+        // Convert rows to DeadLetterEvent objects
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows {
+            items.push(DeadLetterEvent {
+                id: row.get("id"),
+                event_id: row.get("event_id"),
+                stream_name: row.get("stream_name"),
+                stream_id: row.get("stream_id"),
+                handler_name: row.get("handler_name"),
+                error_message: row.get("error_message"),
+                retry_count: row.get("retry_count"),
+                event_data: row.get("event_data"),
+                stream_position: row.get("stream_position"),
+                dead_lettered_at: row.get("dead_lettered_at"),
+            });
+        }
+        
+        Ok(PaginatedResult {
+            items,
+            total_count,
+            page,
+            total_pages,
+        })
+    }
+    
+    async fn replay_dead_letter_event(&self, dead_letter_id: &str) -> Result<()> {
+        // Start a transaction
+        let mut tx = self.pool.begin().await?;
+        
+        // Get the dead letter event
+        let dead_letter = sqlx::query(
+            r#"
+            SELECT 
+                id, event_id, stream_name, stream_id, handler_name,
+                error_message, retry_count, event_data, stream_position
+            FROM dead_letter_events
+            WHERE id = $1
+            "#
+        )
+        .bind(dead_letter_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| anyhow!("Dead letter event not found: {}", dead_letter_id))?;
+        
+        // Verify the original event still exists
+        let original_event = sqlx::query(
+            r#"
+            SELECT id FROM events
+            WHERE stream_name = $1 AND stream_id = $2 AND stream_position = $3
+            "#
+        )
+        .bind(dead_letter.get::<String, _>("stream_name"))
+        .bind(dead_letter.get::<String, _>("stream_id"))
+        .bind(dead_letter.get::<i64, _>("stream_position"))
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| anyhow!("Original event no longer exists"))?;
+        
+        // Reset the processing claim for this stream/handler
+        sqlx::query(
+            r#"
+            UPDATE event_processing_claims
+            SET 
+                last_position = $1 - 1, -- Set to before the failed event position
+                error_count = 0,
+                last_error = NULL,
+                next_retry_at = NULL,
+                claimed_by = NULL,
+                claim_expires_at = NULL,
+                last_updated_at = now()
+            WHERE 
+                stream_name = $2 AND 
+                stream_id = $3 AND 
+                handler_name = $4
+            "#
+        )
+        .bind(dead_letter.get::<i64, _>("stream_position"))
+        .bind(dead_letter.get::<String, _>("stream_name"))
+        .bind(dead_letter.get::<String, _>("stream_id"))
+        .bind(dead_letter.get::<String, _>("handler_name"))
+        .execute(&mut *tx)
+        .await?;
+        
+        // Delete the dead letter event
+        sqlx::query("DELETE FROM dead_letter_events WHERE id = $1")
+            .bind(dead_letter_id)
+            .execute(&mut *tx)
+            .await?;
+            
+        // Commit the transaction
+        tx.commit().await?;
+        
+        info!("Replayed dead letter event: {}", dead_letter_id);
+        
+        // Notify of a new event to trigger processing
+        sqlx::query("SELECT pg_notify('new_event', '0')")
+            .execute(&self.pool)
+            .await?;
+        
+        Ok(())
+    }
+    
+    async fn delete_dead_letter_event(&self, dead_letter_id: &str) -> Result<()> {
+        // Check if the dead letter event exists
+        let exists = sqlx::query("SELECT 1 FROM dead_letter_events WHERE id = $1")
+            .bind(dead_letter_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .is_some();
+            
+        if !exists {
+            return Err(anyhow!("Dead letter event not found: {}", dead_letter_id));
+        }
+        
+        // Delete the dead letter event
+        sqlx::query("DELETE FROM dead_letter_events WHERE id = $1")
+            .bind(dead_letter_id)
+            .execute(&self.pool)
+            .await?;
+            
+        info!("Deleted dead letter event: {}", dead_letter_id);
+        
+        Ok(())
     }
 } 

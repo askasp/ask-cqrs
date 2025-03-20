@@ -7,6 +7,7 @@ mod test_utils;
 
 use common::bank_account::{BankAccountAggregate, BankAccountCommand, BankAccountError};
 use test_utils::{initialize_logger, create_test_store};
+use ask_cqrs::store::event_store::EventStore;
 
 #[tokio::test]
 #[instrument]

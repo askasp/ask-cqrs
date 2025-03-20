@@ -2,6 +2,8 @@ use std::time::Duration;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value as JsonValue;
+use chrono::{DateTime, Utc};
+use serde::{Serialize, Deserialize};
 
 use crate::{
     aggregate::Aggregate,
@@ -10,6 +12,30 @@ use crate::{
     event_handler::{EventHandler, EventRow},
 };
 
+/// An event that has permanently failed processing and was moved to the dead letter queue
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeadLetterEvent {
+    /// Unique ID of the dead letter event record
+    pub id: String,
+    /// Original event ID
+    pub event_id: String,
+    /// Stream name the event belongs to
+    pub stream_name: String,
+    /// Stream ID the event belongs to
+    pub stream_id: String,
+    /// Handler that failed to process the event
+    pub handler_name: String,
+    /// Last error message
+    pub error_message: String,
+    /// Number of retries attempted
+    pub retry_count: i32,
+    /// Original event data
+    pub event_data: JsonValue,
+    /// Position in the stream
+    pub stream_position: i64,
+    /// When the event was moved to dead letter queue
+    pub dead_lettered_at: DateTime<Utc>,
+}
 
 /// Result type for command execution
 #[derive(Debug, Clone)]
@@ -26,6 +52,7 @@ pub struct PaginationOptions {
 }
 
 /// Result for paginated operations
+#[derive(Debug, Clone)]
 pub struct PaginatedResult<T> {
     pub items: Vec<T>,
     pub total_count: i64,
@@ -131,7 +158,7 @@ pub trait EventStore: Send + Sync + Clone {
     ) -> Result<PaginatedResult<V>>;
     
     /// Wait for a view to catch up to a specific position
-    async fn wait_for_view<V: View>(&self, partition_key: &str, target_position: i64, timeout_ms: u64) -> Result<()>;
+    async fn wait_for_view<V: View + Default>(&self, partition_key: &str, target_position: i64, timeout_ms: u64) -> Result<()>;
     
     /// Get a single view by user_id field
     async fn get_view_by_user_id<V: View>(&self, user_id: &str) -> Result<Option<V>>;
@@ -141,4 +168,13 @@ pub trait EventStore: Send + Sync + Clone {
     
     /// Get all views without filtering
     async fn get_all_views<V: View>(&self) -> Result<Vec<V>>;
+
+    /// Get events from the dead letter queue
+    async fn get_dead_letter_events(&self, page: i64, page_size: i32) -> Result<PaginatedResult<DeadLetterEvent>>;
+    
+    /// Replay a dead letter event, removing it from the dead letter queue
+    async fn replay_dead_letter_event(&self, dead_letter_id: &str) -> Result<()>;
+    
+    /// Delete a dead letter event permanently
+    async fn delete_dead_letter_event(&self, dead_letter_id: &str) -> Result<()>;
 }
