@@ -7,7 +7,6 @@ use serde::{Serialize, Deserialize};
 
 use crate::{
     aggregate::Aggregate,
-    view::View,
     command::DomainCommand,
     event_handler::{EventHandler, EventRow},
 };
@@ -137,38 +136,7 @@ pub trait EventStore: Send + Sync + Clone {
         from_position: i64,
         limit: i32,
     ) -> Result<Vec<EventRow>>;
-
-    /// Start a view builder that processes events
-    async fn start_view_builder<V>(
-        &self,
-        config: Option<EventProcessingConfig>,
-    ) -> Result<()>
-    where
-        V: View + Default + Send + Sync + 'static;
     
-    /// Get a view state for a partition
-    async fn get_view_state<V: View>(&self, partition_key: &str) -> Result<Option<V>>;
-    
-    /// Query views by criteria in their state
-    async fn query_views<V: View>(
-        &self,
-        condition: &str,
-        params: Vec<JsonValue>,
-        pagination: Option<PaginationOptions>,
-    ) -> Result<PaginatedResult<V>>;
-    
-    /// Wait for a view to catch up to a specific position
-    async fn wait_for_view<V: View + Default>(&self, partition_key: &str, target_position: i64, timeout_ms: u64) -> Result<()>;
-    
-    /// Get a single view by user_id field
-    async fn get_view_by_user_id<V: View>(&self, user_id: &str) -> Result<Option<V>>;
-    
-    /// Get all views for a given user_id
-    async fn get_views_by_user_id<V: View>(&self, user_id: &str) -> Result<Vec<V>>;
-    
-    /// Get all views without filtering
-    async fn get_all_views<V: View>(&self) -> Result<Vec<V>>;
-
     /// Get events from the dead letter queue
     async fn get_dead_letter_events(&self, page: i64, page_size: i32) -> Result<PaginatedResult<DeadLetterEvent>>;
     

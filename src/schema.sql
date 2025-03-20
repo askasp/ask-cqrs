@@ -37,7 +37,9 @@ CREATE TABLE IF NOT EXISTS view_snapshots (
     view_name TEXT NOT NULL,
     partition_key TEXT NOT NULL,
     state JSONB NOT NULL,
-    last_event_position BIGINT NOT NULL,
+    last_processed_global_position BIGINT NOT NULL,
+    -- Map of "stream_name:stream_id" to stream position
+    processed_stream_positions JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(view_name, partition_key)
 );
@@ -45,7 +47,8 @@ CREATE TABLE IF NOT EXISTS view_snapshots (
 -- Index for efficient view snapshot lookups
 CREATE INDEX IF NOT EXISTS idx_view_snapshots_lookup ON view_snapshots(view_name, partition_key);
 
--- Event processing claims for competing consumers - Enhanced to handle all state
+-- Event processing claims for both event handlers and views
+-- This tracks what has been processed by both handlers and view partitions
 CREATE TABLE IF NOT EXISTS event_processing_claims (
     id TEXT PRIMARY KEY,
     stream_name TEXT NOT NULL,

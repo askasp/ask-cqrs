@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow};
 use sqlx::{postgres::{PgPool, PgListener}, postgres::PgRow, Row, Executor, PgExecutor, FromRow};
 use uuid::Uuid;
-use tracing::{info, warn, error, instrument};
+use tracing::{info, warn, error, debug, instrument};
 use tokio::sync::broadcast;
 use serde_json::{self, Value as JsonValue, json};
 use chrono::{DateTime, Utc};
@@ -11,6 +11,8 @@ use futures::future::join_all;
 use tokio::time::sleep;
 use std::collections::HashMap;
 use async_trait::async_trait;
+use tokio::task::JoinHandle;
+use serde::de::DeserializeOwned;
 
 use crate::{
     store::event_store::{
@@ -22,6 +24,9 @@ use crate::{
     view::View,
     command::DomainCommand,
     event_handler::{EventHandler, EventRow, EventHandlerError},
+    view_event_handler::ViewEventHandler,
+    store::view_store::ViewStore,
+    store::postgres_view_store::PostgresViewStore,
 };
 
 /// PostgreSQL-based event store implementation with competing consumers
@@ -95,13 +100,46 @@ impl PostgresEventStore {
         handler_name: &str,
         config: &EventProcessingConfig,
     ) -> Result<Option<StreamClaim>> {
+        tracing::debug!("Attempting to claim stream {}/{} for handler {}", 
+                      stream_name, stream_id, handler_name);
+        
         let claim_ttl = config.claim_ttl;
         let now = Utc::now();
         let expiration = now + chrono::Duration::from_std(claim_ttl).unwrap();
 
         // First, try to create the claim record if it doesn't exist
         let id = Uuid::new_v4().to_string();
-        sqlx::query(
+        
+        // Check if a claim already exists before trying to create one
+        let existing_claim = sqlx::query(
+            "SELECT id, claimed_by, claim_expires_at FROM event_processing_claims 
+             WHERE stream_name = $1 AND stream_id = $2 AND handler_name = $3"
+        )
+        .bind(stream_name)
+        .bind(stream_id)
+        .bind(handler_name)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some(row) = &existing_claim {
+            let claimed_by: Option<String> = row.get("claimed_by");
+            let expires_at: Option<DateTime<Utc>> = row.get("claim_expires_at");
+            
+            tracing::debug!(
+                "Found existing claim for {}/{}, handler={}: claimed_by={:?}, expires_at={:?}",
+                stream_name, stream_id, handler_name, claimed_by, expires_at
+            );
+        } else {
+            tracing::debug!(
+                "No existing claim found for {}/{}, handler={}. Will create new claim.",
+                stream_name, stream_id, handler_name
+            );
+        }
+        
+        tracing::debug!("Creating claim record for {}/{}, handler={}", 
+                      stream_name, stream_id, handler_name);
+        
+        let insert_result = sqlx::query(
             r#"
             INSERT INTO event_processing_claims 
             (id, stream_name, stream_id, handler_name, last_position, claimed_by, claim_expires_at)
@@ -117,8 +155,13 @@ impl PostgresEventStore {
         .bind(expiration)
         .execute(&self.pool)
         .await?;
+        
+        tracing::debug!("Insert result: {} rows affected", insert_result.rows_affected());
 
         // Now try to claim it if it's unclaimed or expired or ready for retry
+        tracing::debug!("Attempting to update claim for {}/{}, handler={}", 
+                       stream_name, stream_id, handler_name);
+        
         let claim_result = sqlx::query(
             r#"
             UPDATE event_processing_claims
@@ -159,8 +202,64 @@ impl PostgresEventStore {
         if let Some(row) = claim_result {
             // Use FromRow implementation instead of manual conversion
             let stream_claim = StreamClaim::from_row(&row)?;
+            tracing::debug!("Successfully claimed stream {}/{} for handler {}", 
+                           stream_name, stream_id, handler_name);
             Ok(Some(stream_claim))
         } else {
+            // Check why the claim failed
+            let claim_status = sqlx::query(
+                r#"
+                SELECT 
+                    claimed_by, 
+                    claim_expires_at, 
+                    next_retry_at,
+                    last_updated_at
+                FROM event_processing_claims
+                WHERE 
+                    stream_name = $1 AND 
+                    stream_id = $2 AND 
+                    handler_name = $3
+                "#
+            )
+            .bind(stream_name)
+            .bind(stream_id)
+            .bind(handler_name)
+            .fetch_optional(&self.pool)
+            .await?;
+            
+            if let Some(row) = claim_status {
+                let claimed_by: Option<String> = row.get("claimed_by");
+                let expires_at: Option<DateTime<Utc>> = row.get("claim_expires_at");
+                let retry_at: Option<DateTime<Utc>> = row.get("next_retry_at");
+                let updated_at: DateTime<Utc> = row.get("last_updated_at");
+                
+                tracing::debug!(
+                    "Claim failed for {}/{}, handler={}: claimed_by={:?}, expires_at={:?}, retry_at={:?}, updated_at={:?}",
+                    stream_name, stream_id, handler_name, claimed_by, expires_at, retry_at, updated_at
+                );
+                
+                if let Some(claimed) = claimed_by {
+                    if claimed == self.node_id {
+                        tracing::debug!("Stream already claimed by this node: {}", self.node_id);
+                    } else {
+                        tracing::debug!("Stream claimed by another node: {}", claimed);
+                    }
+                }
+                
+                if let Some(expires) = expires_at {
+                    if expires > now {
+                        tracing::debug!("Claim not expired yet. Expires in {} seconds", 
+                                     (expires - now).num_seconds());
+                    } else {
+                        tracing::debug!("Claim is expired, but update failed");
+                    }
+                }
+            } else {
+                tracing::debug!("No claim record found during status check, but create/update failed");
+            }
+            
+            tracing::debug!("Failed to claim stream {}/{} for handler {}", 
+                           stream_name, stream_id, handler_name);
             Ok(None)
         }
     }
@@ -400,56 +499,61 @@ impl PostgresEventStore {
     where
         H: EventHandler + Send + Sync,
     {
-        let rows = sqlx::query(
-            r#"
-            SELECT 
-                id, stream_name, stream_id, event_data, metadata, stream_position, global_position, created_at
-            FROM events 
-            WHERE 
-                stream_name = $1 AND 
-                stream_id = $2 AND 
-                stream_position > $3
-            ORDER BY stream_position
-            LIMIT $4
-            "#
-        )
-        .bind(stream_name)
-        .bind(stream_id)
-        .bind(last_position)
-        .bind(config.batch_size)
-        .fetch_all(&self.pool)
-        .await?;
-
-        let mut final_position = last_position;
-        for row in rows {
-            if let Ok(event) = serde_json::from_value(row.get("event_data")) {
-                let event_row = EventRow {
-                    id: row.get("id"),
-                    stream_name: row.get("stream_name"),
-                    stream_id: row.get("stream_id"),
-                    event_data: row.get("event_data"),
-                    metadata: row.get("metadata"),
-                    stream_position: row.get("stream_position"),
-                    global_position: row.get("global_position"),
-                    created_at: row.get("created_at"),
-                };
-                
-                handler.handle_event(event, event_row.clone()).await
-                    .map_err(|e| anyhow!("Handler error: {}", e))?;
-                
-                final_position = row.get("stream_position");
-                
-                // Update claim after each event for durability
-                self.update_stream_claim_success(
-                    stream_name,
-                    stream_id,
-                    H::name(),
-                    final_position
-                ).await?;
+        tracing::debug!(
+            "Processing events for handler '{}' stream '{}/{}' from position {}",
+            H::name(), stream_name, stream_id, last_position
+        );
+        
+        // Get events for this stream that need processing
+        let events = self.get_events_for_stream(
+            stream_name,
+            stream_id,
+            last_position,
+            config.batch_size,
+        ).await?;
+        
+        tracing::debug!("Found {} events to process for handler '{}'", events.len(), H::name());
+        
+        if events.is_empty() {
+            return Ok(last_position);
+        }
+        
+        let mut max_position = last_position;
+        
+        // Process each event in order
+        for event in events {
+            let position = event.stream_position;
+            
+            tracing::debug!(
+                "Processing event: stream={}/{}, position={}, global_position={}, handler={}",
+                event.stream_name, event.stream_id, event.stream_position, 
+                event.global_position, H::name()
+            );
+            
+            // Try to deserialize and handle the event
+            match serde_json::from_value::<H::Events>(event.event_data.clone()) {
+                Ok(typed_event) => {
+                    if let Err(e) = handler.handle_event(typed_event, event.clone()).await {
+                        return Err(anyhow!(e.log_message));
+                    }
+                    // Update the max position we've processed successfully
+                    max_position = position;
+                },
+                Err(e) => {
+                    tracing::error!(
+                        "Error deserializing event: stream={}/{}, position={}, error={}", 
+                        stream_name, stream_id, position, e
+                    );
+                }
             }
         }
-
-        Ok(final_position)
+        
+        tracing::debug!(
+            "Processed events for handler '{}' stream '{}/{}' up to position {}",
+            H::name(), stream_name, stream_id, max_position
+        );
+        
+        Ok(max_position)
     }
 
     /// Get all active streams for a given handler
@@ -457,515 +561,235 @@ impl PostgresEventStore {
         &self,
         handler_name: &str,
     ) -> Result<Vec<(String, String)>> {
-        // First, check for any streams with unprocessed events
-        let rows = sqlx::query(
+        tracing::info!("Getting active streams for handler: {}", handler_name);
+        
+        // Check existing claims for this handler
+        let existing_claims = sqlx::query(
             r#"
-            SELECT DISTINCT e.stream_name, e.stream_id
-            FROM events e
-            LEFT JOIN event_processing_claims c ON 
-                e.stream_name = c.stream_name AND 
-                e.stream_id = c.stream_id AND 
-                c.handler_name = $1
-            WHERE 
-                c.id IS NULL OR 
-                e.stream_position > c.last_position
-            LIMIT 100
-            "#
-        )
-        .bind(handler_name)
-        .fetch_all(&self.pool)
-        .await?;
-
-        let mut streams = Vec::new();
-        for row in rows {
-            streams.push((
-                row.get::<String, _>("stream_name"),
-                row.get::<String, _>("stream_id")
-            ));
-        }
-
-        // Also check for streams with failed processing ready for retry
-        let retry_rows = sqlx::query(
-            r#"
-            SELECT stream_name, stream_id
+            SELECT stream_name, stream_id, last_position, error_count, next_retry_at
             FROM event_processing_claims
-            WHERE 
-                handler_name = $1 AND
-                next_retry_at IS NOT NULL AND
-                next_retry_at <= now() AND
-                (claimed_by IS NULL OR claim_expires_at < now())
-            LIMIT 100
+            WHERE handler_name = $1
             "#
         )
         .bind(handler_name)
         .fetch_all(&self.pool)
         .await?;
-
-        for row in retry_rows {
-            let stream_name = row.get::<String, _>("stream_name");
-            let stream_id = row.get::<String, _>("stream_id");
-            
-            // Only add if not already in the list
-            if !streams.contains(&(stream_name.clone(), stream_id.clone())) {
-                streams.push((stream_name, stream_id));
-            }
+        
+        tracing::info!("Found {} existing claims for handler {}", existing_claims.len(), handler_name);
+        for row in &existing_claims {
+            let stream_name: String = row.get("stream_name");
+            let stream_id: String = row.get("stream_id"); 
+            let last_position: i64 = row.get("last_position");
+            let error_count: i32 = row.get("error_count");
+            tracing::info!("Claim: {}/{}, last_position={}, error_count={}", 
+                          stream_name, stream_id, last_position, error_count);
         }
-
-        Ok(streams)
-    }
-
-    /// Process view events for a specific partition
-    async fn process_view_events<V>(
-        &self,
-        view: &V,
-        partition_key: &str, 
-        last_position: i64,
-        config: &EventProcessingConfig,
-    ) -> Result<i64>
-    where
-        V: View + Send + Sync,
-    {
-        let rows = sqlx::query(
+        
+        // Check for any events in the database
+        let all_events = sqlx::query(
             r#"
-            SELECT 
-                id, stream_name, stream_id, event_data, metadata, stream_position, global_position, created_at
-            FROM events 
-            WHERE global_position > $1
+            SELECT COUNT(*) as count FROM events
+            "#
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        
+        let event_count: i64 = all_events.get("count");
+        tracing::info!("Found {} total events in the database", event_count);
+        
+        // Get a sample of events
+        let sample_events = sqlx::query(
+            r#"
+            SELECT stream_name, stream_id, stream_position, global_position
+            FROM events
             ORDER BY global_position
-            LIMIT $2
+            LIMIT 5
             "#
         )
-        .bind(last_position)
-        .bind(config.batch_size)
         .fetch_all(&self.pool)
         .await?;
-
-        let mut final_position = last_position;
-        for row in rows {
-            if let Ok(event) = serde_json::from_value(row.get("event_data")) {
-                let event_row = EventRow {
-                    id: row.get("id"),
-                    stream_name: row.get("stream_name"),
-                    stream_id: row.get("stream_id"),
-                    event_data: row.get("event_data"),
-                    metadata: row.get("metadata"),
-                    stream_position: row.get("stream_position"),
-                    global_position: row.get("global_position"),
-                    created_at: row.get("created_at"),
-                };
-
-                if let Some(pk) = V::get_partition_key(&event, &event_row) {
-                    if pk == partition_key {
-                        // Get or initialize view state
-                        let mut view_state = match self.get_view_state::<V>(partition_key).await? {
-                            Some(state) => state,
-                            None => match V::initialize(&event, &event_row) {
-                                Some(view) => view,
-                                None => {
-                                    error!("Failed to initialize view for {}", partition_key);
-                                    return Ok(last_position);
-                                }
-                            },
-                        };
-                        
-                        // Apply the event
-                        view_state.apply_event(&event, &event_row);
-                        
-                        // Save updated view state
-                        self.save_view_state::<V>(partition_key, &view_state, event_row.global_position).await?;
-                        
-                        final_position = event_row.global_position;
-                    }
-                }
-            }
+        
+        for row in &sample_events {
+            let stream_name: String = row.get("stream_name");
+            let stream_id: String = row.get("stream_id");
+            let stream_position: i64 = row.get("stream_position");
+            let global_position: i64 = row.get("global_position");
+            tracing::info!("Event: {}/{}, stream_pos={}, global_pos={}", 
+                          stream_name, stream_id, stream_position, global_position);
         }
-
-        Ok(final_position)
-    }
-
-    /// Save a view state to the database
-    async fn save_view_state<V: View>(
-        &self,
-        partition_key: &str,
-        view: &V,
-        position: i64,
-    ) -> Result<()> {
-        let state_json = serde_json::to_value(view)?;
-        let id = Uuid::new_v4();
-
-        sqlx::query(
+        
+        // First, find all streams that have events after the last processed position
+        let streams_with_new_events = sqlx::query(
             r#"
-            INSERT INTO view_snapshots (id, view_name, partition_key, state, last_event_position)
-            VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (view_name, partition_key) 
-            DO UPDATE SET state = $4, last_event_position = $5
-            "#
-        )
-        .bind(id)
-        .bind(V::name())
-        .bind(partition_key)
-        .bind(&state_json)
-        .bind(position)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
-
-    /// Get all partition keys for a view
-    async fn get_view_partitions<V: View>(&self) -> Result<Vec<String>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT partition_key
-            FROM view_snapshots
-            WHERE view_name = $1
-            "#
-        )
-        .bind(V::name())
-        .fetch_all(&self.pool)
-        .await?;
-
-        let partitions = rows.into_iter()
-            .map(|row| row.get::<String, _>("partition_key"))
-            .collect();
-
-        Ok(partitions)
-    }
-
-    /// Start processing for view partitions
-    async fn start_view_partition_processors<V>(
-        &self,
-        config: EventProcessingConfig,
-    ) -> Result<()>
-    where
-        V: View + Default + Send + Sync + 'static,
-    {
-        let view_name = V::name();
-        let view = V::default();
-
-        // Get the latest global position to start from
-        let starting_position = match sqlx::query("SELECT COALESCE(MAX(global_position), -1) as pos FROM events")
-            .fetch_one(&self.pool)
-            .await
-        {
-            Ok(row) => row.get::<i64, _>("pos"),
-            Err(e) => {
-                error!("Failed to get latest event position: {}", e);
-                -1
-            }
-        };
-
-        info!("Starting view builder for {} from position {}", view_name, starting_position);
-        
-        // Start listener for new events
-        let mut listener = PgListener::connect_with(&self.pool).await?;
-        listener.listen("new_event").await?;
-        
-        // Spawn background task
-        let store = self.clone();
-        let mut shutdown = self.shutdown.subscribe();
-        
-        // Process all events first (this will initialize all partitions)
-        let store_clone = store.clone();
-        let config_clone = config.clone();
-        let view_clone = view.clone();
-        
-        tokio::spawn(async move {
-            // Initial processing of all events
-            if let Err(e) = store_clone.process_all_view_events::<V>(&view_clone, -1, &config_clone).await {
-                error!("Error in initial view processing: {}", e);
-            }
-            
-            let poll_interval = Duration::from_secs(5);
-            
-            loop {
-                tokio::select! {
-                    // Wait for new event notification
-                    Ok(_) = listener.recv() => {
-                        // When new event arrives, process all events
-                        if let Err(e) = store.process_all_view_events::<V>(&view, -1, &config).await {
-                            error!("Error processing view events: {}", e);
-                        }
-                    }
-                    
-                    // Periodic poll for updates
-                    _ = sleep(poll_interval) => {
-                        // Check for any new events periodically
-                        if let Err(e) = store.process_all_view_events::<V>(&view, -1, &config).await {
-                            error!("Error processing view events: {}", e);
-                        }
-                    }
-                    
-                    // Shutdown signal
-                    _ = shutdown.recv() => break,
-                }
-            }
-        });
-
-        Ok(())
-    }
-    
-    /// Process all events for a view regardless of partition
-    async fn process_all_view_events<V>(
-        &self,
-        view: &V,
-        force_position: i64,
-        config: &EventProcessingConfig,
-    ) -> Result<i64>
-    where
-        V: View + Send + Sync,
-    {
-        // When force_position is provided, use that, otherwise get the highest global position from any
-        // existing view snapshots to avoid reprocessing
-        let last_position = if force_position >= 0 {
-            force_position
-        } else {
-            // Get max position from view snapshots
-            let max_pos_query = sqlx::query(
-                r#"
-                SELECT COALESCE(MAX(last_event_position), -1) as max_pos
-                FROM view_snapshots
-                WHERE view_name = $1
-                "#
+            WITH last_positions AS (
+                SELECT 
+                    stream_name, 
+                    stream_id, 
+                    MAX(last_position) as position
+                FROM 
+                    event_processing_claims
+                WHERE 
+                    handler_name = $1
+                GROUP BY 
+                    stream_name, stream_id
             )
-            .bind(V::name())
-            .fetch_one(&self.pool)
-            .await?;
-            
-            max_pos_query.get::<i64, _>("max_pos")
-        };
-
-        let rows = sqlx::query(
-            r#"
-            SELECT 
-                id, stream_name, stream_id, event_data, metadata, stream_position, global_position, created_at
-            FROM events 
-            WHERE global_position > $1
-            ORDER BY global_position
-            LIMIT $2
+            SELECT DISTINCT 
+                e.stream_name, 
+                e.stream_id
+            FROM 
+                events e
+            LEFT JOIN 
+                last_positions lp
+            ON 
+                e.stream_name = lp.stream_name AND
+                e.stream_id = lp.stream_id
+            WHERE 
+                (lp.position IS NULL OR e.stream_position > lp.position)
+            ORDER BY 
+                e.stream_name, e.stream_id
             "#
         )
-        .bind(last_position)
-        .bind(config.batch_size)
+        .bind(handler_name)
         .fetch_all(&self.pool)
         .await?;
-
-        if rows.is_empty() {
-            return Ok(last_position);
-        }
-
-        let mut final_position = last_position;
-        let mut updated_partitions = std::collections::HashSet::new();
         
-        for row in rows {
-            if let Ok(event) = serde_json::from_value::<V::Event>(row.get("event_data")) {
-                let event_row = EventRow {
-                    id: row.get("id"),
-                    stream_name: row.get("stream_name"),
-                    stream_id: row.get("stream_id"),
-                    event_data: row.get("event_data"),
-                    metadata: row.get("metadata"),
-                    stream_position: row.get("stream_position"),
-                    global_position: row.get("global_position"),
-                    created_at: row.get("created_at"),
-                };
-
-                if let Some(pk) = V::get_partition_key(&event, &event_row) {
-                    // Get the latest position for this partition
-                    let partition_position = match sqlx::query(
-                        r#"
-                        SELECT last_event_position
-                        FROM view_snapshots
-                        WHERE view_name = $1 AND partition_key = $2
-                        "#
-                    )
-                    .bind(V::name())
-                    .bind(&pk)
-                    .fetch_optional(&self.pool)
-                    .await? {
-                        Some(row) => row.get::<i64, _>("last_event_position"),
-                        None => -1
-                    };
-                    
-                    // Only process if this event is newer than what the partition has seen
-                    if event_row.global_position > partition_position {
-                        // Get or initialize view state
-                        let mut view_state = match self.get_view_state::<V>(&pk).await? {
-                            Some(state) => state,
-                            None => match V::initialize(&event, &event_row) {
-                                Some(new_view) => new_view,
-                                None => {
-                                    error!("Failed to initialize view for {}", pk);
-                                    continue; // Skip this event and try the next one
-                                }
-                            },
-                        };
-                        
-                        // Apply the event
-                        view_state.apply_event(&event, &event_row);
-                        
-                        // Save updated view state
-                        self.save_view_state::<V>(&pk, &view_state, event_row.global_position).await?;
-                        
-                        updated_partitions.insert(pk);
-                    }
-                }
-                
-                final_position = event_row.global_position;
-            }
+        let mut result = Vec::with_capacity(streams_with_new_events.len());
+        
+        // Track how many streams we found
+        let found_streams = streams_with_new_events.len();
+        
+        for row in streams_with_new_events {
+            let stream_name: String = row.get("stream_name");
+            let stream_id: String = row.get("stream_id");
+            tracing::info!("Active stream found: {}/{} for handler {}", 
+                          stream_name, stream_id, handler_name);
+            result.push((stream_name, stream_id));
         }
-
-        if !updated_partitions.is_empty() {
-            info!("Updated {} partitions for view {}", updated_partitions.len(), V::name());
-        }
-
-        Ok(final_position)
+        
+        tracing::info!("Found {} active streams for handler: {}", found_streams, handler_name);
+        Ok(result)
     }
 
-    /// Get the last processed position for a view
-    async fn get_view_last_position<V: View>(&self, partition_key: &str) -> Result<Option<i64>> {
-        let row = sqlx::query(
-            r#"
-            SELECT last_event_position
-            FROM view_snapshots
-            WHERE view_name = $1 AND partition_key = $2
-            "#
-        )
-        .bind(V::name())
-        .bind(partition_key)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        match row {
-            Some(row) => Ok(Some(row.get::<i64, _>("last_event_position"))),
-            None => Ok(None),
-        }
-    }
-
-    /// Start monitoring for new streams that need processing
-    async fn start_handler_monitor<H>(
+       
+    /// Start a view as an event handler
+    pub async fn start_view<V: View + Default + Send + Sync + 'static>(
         &self,
-        handler: H,
-        config: EventProcessingConfig,
-    ) -> Result<()>
-    where
-        H: EventHandler + Send + Sync + Clone + 'static,
-    {
-        let handler_name = H::name().to_string();
-        info!("Starting handler monitor for {}", handler_name);
-        
-        // Create a listener for new events
-        let mut listener = PgListener::connect_with(&self.pool).await?;
-        listener.listen("new_event").await?;
-        
-        let store = self.clone();
-        let mut shutdown = self.shutdown.subscribe();
-        
-        tokio::spawn(async move {
-            // Immediately check for any existing streams
-            let _ = store.check_streams_for_handler(&handler, &config).await;
-            
-            let poll_interval = Duration::from_secs(5);
-            
-            loop {
-                tokio::select! {
-                    // Handle new event notifications
-                    Ok(_) = listener.recv() => {
-                        if let Err(e) = store.check_streams_for_handler(&handler, &config).await {
-                            error!("Error checking streams for handler {}: {}", handler_name, e);
-                        }
-                    }
-                    
-                    // Periodic poll to find new streams or retry failed ones
-                    _ = sleep(poll_interval) => {
-                        if let Err(e) = store.check_streams_for_handler(&handler, &config).await {
-                            error!("Error checking streams for handler {}: {}", handler_name, e);
-                        }
-                    }
-                    
-                    // Shutdown signal
-                    _ = shutdown.recv() => break,
-                }
-            }
-            
-            info!("Handler monitor for {} shutting down", handler_name);
-        });
-        
-        Ok(())
+        view_store: PostgresViewStore,
+        config: Option<EventProcessingConfig>,
+    ) -> Result<()> {
+        let handler = ViewEventHandler::<V>::new(view_store);
+        self.start_event_handler(handler, config).await
     }
     
-    /// Check for streams that need processing for a handler
-    async fn check_streams_for_handler<H>(
+    /// Helper method to create a ViewStore that shares the same database connection
+    pub fn create_view_store(&self) -> PostgresViewStore {
+        PostgresViewStore::new(self.pool.clone())
+    }
+
+    /// Find streams that need processing and claim them
+    async fn find_and_claim_streams(
+        &self,
+        handler_name: &str,
+        config: &EventProcessingConfig,
+    ) -> Result<usize> {
+        // Find streams with events needing processing
+        let streams = self.get_active_streams_for_handler(handler_name).await?;
+        
+        let mut claimed_count = 0;
+        
+        // Try to claim each stream
+        for (stream_name, stream_id) in streams {
+            if let Ok(Some(_)) = self.claim_stream(
+                &stream_name,
+                &stream_id,
+                handler_name,
+                config
+            ).await {
+                claimed_count += 1;
+                debug!("Claimed stream {}/{} for handler {}", stream_name, stream_id, handler_name);
+            }
+        }
+        
+        Ok(claimed_count)
+    }
+    
+    /// Process streams that have already been claimed by this node
+    async fn process_claimed_streams<H: EventHandler + Send + Sync + Clone>(
         &self,
         handler: &H,
         config: &EventProcessingConfig,
-    ) -> Result<()>
-    where
-        H: EventHandler + Send + Sync + Clone,
-    {
-        // Find streams with events needing processing
-        let streams = self.get_active_streams_for_handler(H::name()).await?;
+    ) -> Result<usize> {
+        // Find streams claimed by this node for this handler
+        let claimed_streams = sqlx::query(
+            r#"
+            SELECT stream_name, stream_id, last_position
+            FROM event_processing_claims
+            WHERE handler_name = $1 AND claimed_by = $2
+            "#
+        )
+        .bind(H::name())
+        .bind(&self.node_id)
+        .fetch_all(&self.pool)
+        .await?;
         
-        // Process each stream
-        for (stream_name, stream_id) in streams {
-            let handler_clone = handler.clone();
-            let config_clone = config.clone();
-            let store = self.clone();
+        let mut processed_count = 0;
+        
+        // Process each claimed stream
+        for row in claimed_streams {
+            let stream_name: String = row.get("stream_name");
+            let stream_id: String = row.get("stream_id");
+            let last_position: i64 = row.get("last_position");
             
-            // Using an inline task to concurrently process streams
-            // while the main monitor continues checking for more
-            tokio::spawn(async move {
-                if let Ok(Some(claim)) = store.claim_stream(
-                    &stream_name,
-                    &stream_id,
-                    H::name(),
-                    &config_clone
-                ).await {
-                    // Process the stream's events
-                    match store.process_stream_events(
-                        &handler_clone,
-                        &stream_name,
-                        &stream_id,
-                        claim.last_position,
-                        &config_clone
-                    ).await {
-                        Ok(position) => {
-                            if let Err(e) = store.update_stream_claim_success(
-                                &stream_name,
-                                &stream_id,
-                                H::name(),
-                                position
-                            ).await {
-                                error!("Error updating claim success: {}", e);
-                            }
-                        },
-                        Err(e) => {
-                            error!("Error processing stream events: {}", e);
-                            if let Err(e) = store.update_stream_claim_error(
-                                &stream_name,
-                                &stream_id,
-                                H::name(),
-                                &e.to_string(),
-                                &config_clone
-                            ).await {
-                                error!("Error updating claim error: {}", e);
-                            }
-                        }
-                    }
+            debug!("Processing claimed stream {}/{} from position {}", 
+                   stream_name, stream_id, last_position);
+            
+            // Process the stream's events
+            match self.process_stream_events(
+                handler,
+                &stream_name,
+                &stream_id,
+                last_position,
+                config
+            ).await {
+                Ok(position) => {
+                    debug!("Successfully processed stream {}/{} up to position {}",
+                           stream_name, stream_id, position);
                     
-                    // Release the claim when done
-                    if let Err(e) = store.release_stream(
+                    if let Err(e) = self.update_stream_claim_success(
                         &stream_name,
                         &stream_id,
-                        H::name()
+                        H::name(),
+                        position
                     ).await {
-                        error!("Error releasing stream claim: {}", e);
+                        error!("Error updating claim success: {}", e);
+                    }
+                    processed_count += 1;
+                },
+                Err(e) => {
+                    error!("Error processing stream events: {}", e);
+                    if let Err(e) = self.update_stream_claim_error(
+                        &stream_name,
+                        &stream_id,
+                        H::name(),
+                        &e.to_string(),
+                        config
+                    ).await {
+                        error!("Error updating claim error: {}", e);
                     }
                 }
-            });
+            }
+            
+            // Release the claim when done
+            if let Err(e) = self.release_stream(
+                &stream_name,
+                &stream_id,
+                H::name()
+            ).await {
+                error!("Error releasing stream claim: {}", e);
+            }
         }
         
-        Ok(())
+        Ok(processed_count)
     }
 }
 
@@ -1120,7 +944,7 @@ impl EventStore for PostgresEventStore {
             .bind(final_global_position.to_string())
             .execute(&mut *tx)
             .await?;
-
+            
         tx.commit().await?;
 
         Ok(CommandResult {
@@ -1166,189 +990,84 @@ impl EventStore for PostgresEventStore {
         config: Option<EventProcessingConfig>,
     ) -> Result<()> {
         let config = config.unwrap_or_default();
-        self.start_handler_monitor(handler, config).await
-    }
-    
-    async fn start_view_builder<V>(
-        &self,
-        config: Option<EventProcessingConfig>,
-    ) -> Result<()>
-    where
-        V: View + Default + Send + Sync + 'static,
-    {
-        let config = config.unwrap_or_default();
-        self.start_view_partition_processors::<V>(config).await
-    }
-    
-    async fn get_view_state<V: View>(&self, partition_key: &str) -> Result<Option<V>> {
-        let row = sqlx::query(
-            "SELECT state 
-             FROM view_snapshots 
-             WHERE view_name = $1 AND partition_key = $2"
-        )
-        .bind(V::name())
-        .bind(partition_key)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        match row {
-            Some(row) => Ok(Some(serde_json::from_value(row.get("state"))?)),
-            None => Ok(None)
-        }
-    }
-    
-    async fn query_views<V: View>(
-        &self,
-        condition: &str,
-        params: Vec<JsonValue>,
-        pagination: Option<PaginationOptions>,
-    ) -> Result<PaginatedResult<V>> {
-        // First get total count
-        let view_name = V::name();
-        let count_query = format!(
-            "SELECT COUNT(*) as count 
-             FROM view_snapshots 
-             WHERE view_name = $1 
-             AND {}", 
-            condition
-        );
-
-        let mut count_builder = sqlx::query(&count_query).bind(view_name.clone());
-        for param in &params {
-            count_builder = count_builder.bind(param);
-        }
-
-        let count_row = count_builder.fetch_one(&self.pool).await?;
-        let total_count: i64 = count_row.get("count");
-
-        if total_count == 0 {
-            return Ok(PaginatedResult {
-                items: vec![],
-                total_count: 0,
-                page: 0,
-                total_pages: 0,
-            });
-        }
-
-        // Add pagination if provided
-        let (query, page, page_size) = if let Some(ref pagination) = pagination {
-            (
-                format!(
-                    "SELECT partition_key, state 
-                     FROM view_snapshots 
-                     WHERE view_name = $1 
-                     AND {}
-                     ORDER BY partition_key 
-                     LIMIT ${} OFFSET ${}", 
-                    condition,
-                    params.len() + 2,
-                    params.len() + 3
-                ),
-                pagination.page,
-                pagination.page_size,
-            )
-        } else {
-            (
-                format!(
-                    "SELECT partition_key, state 
-                     FROM view_snapshots 
-                     WHERE view_name = $1 
-                     AND {}
-                     ORDER BY partition_key",
-                    condition
-                ),
-                0,
-                total_count,
-            )
-        };
-
-        let mut query_builder = sqlx::query(&query).bind(view_name);
-        for param in &params {
-            query_builder = query_builder.bind(param);
-        }
-
-        // Add pagination parameters if provided
-        if pagination.is_some() {
-            query_builder = query_builder
-                .bind(page_size)
-                .bind(page * page_size);
-        }
-
-        let rows = query_builder.fetch_all(&self.pool).await?;
-
-        let mut items = Vec::with_capacity(rows.len());
-        for row in rows {
-            let view: V = serde_json::from_value(row.get("state"))?;
-            items.push(view);
-        }
-
-        Ok(PaginatedResult {
-            items,
-            total_count,
-            page,
-            total_pages: (total_count as f64 / page_size as f64).ceil() as i64,
-        })
-    }
-    
-    async fn wait_for_view<V: View + Default>(&self, partition_key: &str, target_position: i64, timeout_ms: u64) -> Result<()> {
-        let start = Instant::now();
-        let timeout = Duration::from_millis(timeout_ms);
-        let view = V::default();
-        let config = EventProcessingConfig::default();
         
-        // Try to process events immediately to ensure the view is created and up to date
-        self.process_all_view_events::<V>(&view, -1, &config).await?;
-
-        loop {
-            let row = sqlx::query(
-                "SELECT last_event_position 
-                 FROM view_snapshots 
-                 WHERE view_name = $1 AND partition_key = $2"
-            )
-            .bind(V::name())
-            .bind(partition_key)
-            .fetch_optional(&self.pool)
-            .await?;
-
-            if let Some(row) = row {
-                let position: i64 = row.get("last_event_position");
-                if position >= target_position {
-                    return Ok(());
+        let handler_name = H::name().to_string();
+        info!("Starting handler monitor for {}", handler_name);
+        
+        // Create a listener for new events
+        let mut listener = PgListener::connect_with(&self.pool).await?;
+        listener.listen("new_event").await?;
+        
+        let store_claim = self.clone();
+        let store_process = self.clone();
+        let mut shutdown_claim = self.shutdown.subscribe();
+        let mut shutdown_process = self.shutdown.subscribe();
+        let config_claim = config.clone();
+        let config_process = config.clone();
+        let handler_clone = handler.clone();
+        let handler_name_claim = handler_name.clone();
+        let handler_name_process = handler_name.clone();
+        
+        // THREAD 1: Continuously look for streams to claim
+        tokio::spawn(async move {
+            info!("Starting claim thread for handler: {}", handler_name_claim);
+            loop {
+                // Break on shutdown signal
+                if shutdown_claim.try_recv().is_ok() {
+                    info!("Shutting down claim thread for handler: {}", handler_name_claim);
+                    break;
+                }
+                
+                match store_claim.find_and_claim_streams(&handler_name_claim, &config_claim).await {
+                    Ok(claimed) => {
+                        if claimed > 0 {
+                            debug!("Claimed {} streams for handler: {}", claimed, handler_name_claim);
+                        }
+                    },
+                    Err(e) => {
+                        error!("Error claiming streams for handler {}: {}", handler_name_claim, e);
+                    }
+                }
+                
+                // Wait for notification or timeout
+                tokio::select! {
+                    _ = listener.recv() => {
+                        debug!("Received notification of new event for handler: {}", handler_name_claim);
+                    }
+                    _ = tokio::time::sleep(config_claim.poll_interval) => {
+                        // Regular polling interval
+                    }
                 }
             }
-
-            // Try processing again in case we missed something - force position -1 to check all events
-            self.process_all_view_events::<V>(&view, -1, &config).await?;
-
-            if start.elapsed() > timeout {
-                return Err(anyhow!("Timeout waiting for view to catch up"));
+        });
+        
+        // THREAD 2: Process streams that are already claimed by this node
+        tokio::spawn(async move {
+            info!("Starting process thread for handler: {}", handler_name_process);
+            loop {
+                // Break on shutdown signal
+                if shutdown_process.try_recv().is_ok() {
+                    info!("Shutting down process thread for handler: {}", handler_name_process);
+                    break;
+                }
+                
+                match store_process.process_claimed_streams(&handler_clone, &config_process).await {
+                    Ok(processed) => {
+                        if processed > 0 {
+                            debug!("Processed {} claimed streams for handler: {}", processed, handler_name_process);
+                        }
+                    },
+                    Err(e) => {
+                        error!("Error processing claimed streams for handler {}: {}", handler_name_process, e);
+                    }
+                }
+                
+                // Sleep briefly to avoid tight loop
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
-
-            sleep(Duration::from_millis(50)).await;
-        }
-    }
-    
-    async fn get_view_by_user_id<V: View>(&self, user_id: &str) -> Result<Option<V>> {
-        let res = self.query_views::<V>(
-            "state->>'user_id' = ($2#>>'{}')::text",
-            vec![json!(user_id)],
-            None,
-        ).await?;
-        Ok(res.items.first().cloned())
-    }
-    
-    async fn get_views_by_user_id<V: View>(&self, user_id: &str) -> Result<Vec<V>> {
-        let res = self.query_views::<V>(
-            "state->>'user_id' = ($2#>>'{}')::text",
-            vec![json!(user_id)],
-            None,
-        ).await?;
-        Ok(res.items)
-    }
-    
-    async fn get_all_views<V: View>(&self) -> Result<Vec<V>> {
-        let res = self.query_views::<V>("true", vec![], None).await?;
-        Ok(res.items)
+        });
+        
+        Ok(())
     }
     
     async fn get_dead_letter_events(&self, page: i64, page_size: i32) -> Result<PaginatedResult<DeadLetterEvent>> {
