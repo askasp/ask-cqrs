@@ -41,6 +41,8 @@ pub struct DeadLetterEvent {
 pub struct CommandResult {
     pub stream_id: String,
     pub global_position: i64,
+    pub stream_position: i64,
+    pub events: Vec<EventRow>,
 }
 
 /// Options for pagination
@@ -140,9 +142,4 @@ pub trait EventStore: Send + Sync + Clone {
     /// Get events from the dead letter queue
     async fn get_dead_letter_events(&self, page: i64, page_size: i32) -> Result<PaginatedResult<DeadLetterEvent>>;
     
-    /// Replay a dead letter event, removing it from the dead letter queue
-    async fn replay_dead_letter_event(&self, dead_letter_id: &str) -> Result<()>;
-    
-    /// Delete a dead letter event permanently
-    async fn delete_dead_letter_event(&self, dead_letter_id: &str) -> Result<()>;
 }

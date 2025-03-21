@@ -42,8 +42,13 @@ pub trait ViewStore: Send + Sync + Clone {
         pagination: Option<PaginationOptions>,
     ) -> Result<PaginatedResult<V>>;
     
-    /// Wait for a view to catch up to a specific position
-    async fn wait_for_view<V: View + Default>(&self, partition_key: &str, target_position: i64, timeout_ms: u64) -> Result<()>;
+    /// Wait for a view to catch up to a specific event
+    async fn wait_for_view<V: View + Default>(
+        &self,
+        event: &EventRow,
+        partition_key: &str,
+        timeout_ms: u64,
+    ) -> Result<()>;
     
     /// Get a single view by user_id field
     async fn get_view_by_user_id<V: View>(&self, user_id: &str) -> Result<Option<V>>;
@@ -53,4 +58,30 @@ pub trait ViewStore: Send + Sync + Clone {
     
     /// Get all views without filtering
     async fn get_all_views<V: View>(&self) -> Result<Vec<V>>;
+
+    /// Get the state of a view for a specific stream
+    async fn get_view_state_by_stream<V: View + Default>(
+        &self,
+        stream_name: &str,
+        stream_id: &str, 
+        partition_key: &str
+    ) -> Result<Option<V>>;
+
+    /// Save a view state with a stream position
+    async fn save_view_state_with_position<V: View + Default>(
+        &self,
+        stream_name: &str,
+        stream_id: &str,
+        partition_key: &str,
+        state: &V,
+        position: i64,
+    ) -> Result<()>;
+
+    /// Get the position of a view
+    async fn get_view_state_position<V: View + Default>(
+        &self,
+        partition_key: &str,
+        stream_name: &str,
+        stream_id: &str,
+    ) -> Result<Option<i64>>;
 } 

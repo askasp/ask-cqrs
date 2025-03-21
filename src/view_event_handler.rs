@@ -31,9 +31,7 @@ impl<V: View + Default + 'static> EventHandler for ViewEventHandler<V> {
     type Events = V::Event;
     
     fn name() -> &'static str {
-        // We use the view's name as the handler name
-        // This is safe because we're using 'static lifetime for the trait bound
-        Box::leak(V::name().into_boxed_str())
+        V::name()
     }
     
     async fn handle_event(

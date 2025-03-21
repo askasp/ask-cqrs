@@ -63,19 +63,9 @@ impl PostgresEventStore {
         Ok(store)
     }
     
-    /// Create a new PostgreSQL event store with reduced logging (for tests)
-    pub async fn new_with_reduced_logging(connection_string: &str) -> Result<Self> {
-        let store = Self::new(connection_string).await?;
-        Ok(Self {
-            reduced_logging: true,
-            ..store
-        })
-    }
+    
     
     /// Helper function to determine if a debug message should be logged
-    fn should_log_debug(&self) -> bool {
-        !self.reduced_logging && enabled!(Level::DEBUG)
-    }
 
     /// Check if a table exists in the database
     async fn table_exists(&self, table_name: &str) -> Result<bool> {
@@ -117,10 +107,6 @@ impl PostgresEventStore {
         handler_name: &str,
         config: &EventProcessingConfig,
     ) -> Result<Option<StreamClaim>> {
-        if self.should_log_debug() {
-            tracing::debug!("Attempting to claim stream {}/{} for handler {}", 
-                      stream_name, stream_id, handler_name);
-        }
         
         let claim_ttl = config.claim_ttl;
         let now = Utc::now();
@@ -140,25 +126,7 @@ impl PostgresEventStore {
         .fetch_optional(&self.pool)
         .await?;
 
-        if self.should_log_debug() {
-            if let Some(row) = &existing_claim {
-                let claimed_by: Option<String> = row.get("claimed_by");
-                let expires_at: Option<DateTime<Utc>> = row.get("claim_expires_at");
-                
-                tracing::debug!(
-                    "Found existing claim for {}/{}, handler={}: claimed_by={:?}, expires_at={:?}",
-                    stream_name, stream_id, handler_name, claimed_by, expires_at
-                );
-            } else {
-                tracing::debug!(
-                    "No existing claim found for {}/{}, handler={}. Will create new claim.",
-                    stream_name, stream_id, handler_name
-                );
-            }
-            
-            tracing::debug!("Creating claim record for {}/{}, handler={}", 
-                          stream_name, stream_id, handler_name);
-        }
+   
         
         let insert_result = sqlx::query(
             r#"
@@ -177,11 +145,7 @@ impl PostgresEventStore {
         .execute(&self.pool)
         .await?;
         
-        if self.should_log_debug() {
-            tracing::debug!("Insert result: {} rows affected", insert_result.rows_affected());
-            tracing::debug!("Attempting to update claim for {}/{}, handler={}", 
-                           stream_name, stream_id, handler_name);
-        }
+       
         
         // Now try to claim it if it's unclaimed or expired or ready for retry
         let claim_result = sqlx::query(
@@ -225,16 +189,10 @@ impl PostgresEventStore {
             // Use FromRow implementation instead of manual conversion
             let stream_claim = StreamClaim::from_row(&row)?;
             
-            if self.should_log_debug() {
-                tracing::debug!("Successfully claimed stream {}/{} for handler {}", 
-                               stream_name, stream_id, handler_name);
-            }
-            
-            Ok(Some(stream_claim))
+            return Ok(Some(stream_claim))
         } else {
             // Check why the claim failed
-            if self.should_log_debug() {
-                let claim_status = sqlx::query(
+            let claim_status = sqlx::query(
                     r#"
                     SELECT 
                         claimed_by, 
@@ -291,7 +249,6 @@ impl PostgresEventStore {
             
             Ok(None)
         }
-    }
 
     /// Release a stream claim
     async fn release_stream(
@@ -396,6 +353,8 @@ impl PostgresEventStore {
         .await?;
 
         let error_count = claim.error_count + 1;
+        let mut updated_position = claim.last_position;
+        
         let next_retry_at = if error_count <= config.max_retries {
             Some(Self::calculate_next_retry_time(error_count, config))
         } else {
@@ -417,6 +376,13 @@ impl PostgresEventStore {
                 error_count
             ).await {
                 error!("Failed to move event to dead letter queue: {}", e);
+            } else {
+                // Update position to move past this dead-lettered event
+                updated_position = failed_position;
+                info!(
+                    "Advancing stream position from {} to {} after dead-lettering event",
+                    claim.last_position, updated_position
+                );
             }
             
             // No more retries
@@ -432,7 +398,8 @@ impl PostgresEventStore {
                 next_retry_at = $3,
                 claimed_by = NULL,
                 claim_expires_at = NULL,
-                last_updated_at = now()
+                last_updated_at = now(),
+                last_position = $8
             WHERE 
                 stream_name = $4 AND 
                 stream_id = $5 AND 
@@ -447,6 +414,7 @@ impl PostgresEventStore {
         .bind(stream_id)
         .bind(handler_name)
         .bind(&self.node_id)
+        .bind(updated_position)
         .execute(&self.pool)
         .await?;
 
@@ -531,16 +499,6 @@ impl PostgresEventStore {
     where
         H: EventHandler + Send + Sync,
     {
-        if self.should_log_debug() {
-            tracing::debug!(
-                handler = %H::name(),
-                stream_name = %stream_name,
-                stream_id = %stream_id,
-                last_position = last_position,
-                "Processing events for handler"
-            );
-        }
-        
         // Get events for this stream that need processing
         let fetch_span = info_span!("fetch_events", after_position = last_position, batch_size = config.batch_size);
         let _fetch_guard = fetch_span.enter();
@@ -551,10 +509,6 @@ impl PostgresEventStore {
             config.batch_size,
         ).await?;
         drop(_fetch_guard);
-        
-        if self.should_log_debug() {
-            tracing::debug!(event_count = events.len(), "Found events to process for handler");
-        }
         
         if events.is_empty() {
             return Ok(last_position);
@@ -591,131 +545,91 @@ impl PostgresEventStore {
             }
         }
         
-        if self.should_log_debug() {
-            tracing::debug!(
-                new_position = max_position,
-                "Processed events for handler"
-            );
-        }
+        
         
         Ok(max_position)
     }
 
-    /// Get all active streams for a given handler
-    async fn get_active_streams_for_handler(
+    /// Get streams that are candidates for claiming
+    /// This includes streams with new events and streams that need to be retried
+    async fn get_claim_candidates(
         &self,
         handler_name: &str,
     ) -> Result<Vec<(String, String)>> {
-        tracing::info!("Getting active streams for handler: {}", handler_name);
-        
-        // Check existing claims for this handler
-        let existing_claims = sqlx::query(
+        // Find streams where one of these conditions is true:
+        // 1. New events: Events exist that are beyond the last processed position
+        // 2. Retry candidates: Streams with next_retry_at <= now()
+        // 3. Expired claims: Streams with claim_expires_at < now()
+        let candidates = sqlx::query(
             r#"
-            SELECT stream_name, stream_id, last_position, error_count, next_retry_at
-            FROM event_processing_claims
-            WHERE handler_name = $1
-            "#
-        )
-        .bind(handler_name)
-        .fetch_all(&self.pool)
-        .await?;
-        
-        tracing::info!("Found {} existing claims for handler {}", existing_claims.len(), handler_name);
-        for row in &existing_claims {
-            let stream_name: String = row.get("stream_name");
-            let stream_id: String = row.get("stream_id"); 
-            let last_position: i64 = row.get("last_position");
-            let error_count: i32 = row.get("error_count");
-            tracing::info!("Claim: {}/{}, last_position={}, error_count={}", 
-                          stream_name, stream_id, last_position, error_count);
-        }
-        
-        // Check for any events in the database
-        let all_events = sqlx::query(
-            r#"
-            SELECT COUNT(*) as count FROM events
-            "#
-        )
-        .fetch_one(&self.pool)
-        .await?;
-        
-        let event_count: i64 = all_events.get("count");
-        tracing::info!("Found {} total events in the database", event_count);
-        
-        // Get a sample of events
-        let sample_events = sqlx::query(
-            r#"
-            SELECT stream_name, stream_id, stream_position, global_position
-            FROM events
-            ORDER BY global_position
-            LIMIT 5
-            "#
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        
-        for row in &sample_events {
-            let stream_name: String = row.get("stream_name");
-            let stream_id: String = row.get("stream_id");
-            let stream_position: i64 = row.get("stream_position");
-            let global_position: i64 = row.get("global_position");
-            tracing::info!("Event: {}/{}, stream_pos={}, global_pos={}", 
-                          stream_name, stream_id, stream_position, global_position);
-        }
-        
-        // First, find all streams that have events after the last processed position
-        let streams_with_new_events = sqlx::query(
-            r#"
-            WITH last_positions AS (
-                SELECT 
-                    stream_name, 
-                    stream_id, 
-                    MAX(last_position) as position
+            -- Streams with new events
+            WITH streams_with_new_events AS (
+                WITH last_positions AS (
+                    SELECT 
+                        stream_name, 
+                        stream_id, 
+                        MAX(last_position) as position
+                    FROM 
+                        event_processing_claims
+                    WHERE 
+                        handler_name = $1
+                    GROUP BY 
+                        stream_name, stream_id
+                )
+                SELECT DISTINCT 
+                    e.stream_name, 
+                    e.stream_id,
+                    'new_events' as type
                 FROM 
-                    event_processing_claims
+                    events e
+                LEFT JOIN 
+                    last_positions lp
+                ON 
+                    e.stream_name = lp.stream_name AND
+                    e.stream_id = lp.stream_id
                 WHERE 
-                    handler_name = $1
-                GROUP BY 
-                    stream_name, stream_id
+                    (lp.position IS NULL OR e.stream_position > lp.position)
+            ),
+            -- Streams that need to be retried or have expired claims
+            streams_with_retries AS (
+                SELECT DISTINCT
+                    stream_name,
+                    stream_id,
+                    'retry' as type
+                FROM
+                    event_processing_claims
+                WHERE
+                    handler_name = $1 AND
+                    (
+                        (next_retry_at IS NOT NULL AND next_retry_at <= now()) OR
+                        (claimed_by IS NOT NULL AND claim_expires_at < now())
+                    )
             )
-            SELECT DISTINCT 
-                e.stream_name, 
-                e.stream_id
-            FROM 
-                events e
-            LEFT JOIN 
-                last_positions lp
-            ON 
-                e.stream_name = lp.stream_name AND
-                e.stream_id = lp.stream_id
-            WHERE 
-                (lp.position IS NULL OR e.stream_position > lp.position)
-            ORDER BY 
-                e.stream_name, e.stream_id
+            -- Combine both sets
+            SELECT stream_name, stream_id
+            FROM streams_with_new_events
+            UNION
+            SELECT stream_name, stream_id
+            FROM streams_with_retries
+            ORDER BY stream_name, stream_id
             "#
         )
         .bind(handler_name)
         .fetch_all(&self.pool)
         .await?;
         
-        let mut result = Vec::with_capacity(streams_with_new_events.len());
+        let mut result = Vec::with_capacity(candidates.len());
         
-        // Track how many streams we found
-        let found_streams = streams_with_new_events.len();
-        
-        for row in streams_with_new_events {
+        for row in candidates {
             let stream_name: String = row.get("stream_name");
             let stream_id: String = row.get("stream_id");
-            tracing::info!("Active stream found: {}/{} for handler {}", 
-                          stream_name, stream_id, handler_name);
             result.push((stream_name, stream_id));
         }
         
-        tracing::info!("Found {} active streams for handler: {}", found_streams, handler_name);
+        
         Ok(result)
     }
 
-       
     /// Start a view as an event handler
     pub async fn start_view<V: View + Default + Send + Sync + 'static>(
         &self,
@@ -737,8 +651,8 @@ impl PostgresEventStore {
         handler_name: &str,
         config: &EventProcessingConfig,
     ) -> Result<usize> {
-        // Find streams with events needing processing
-        let streams = self.get_active_streams_for_handler(handler_name).await?;
+        // Find streams with events needing processing or retry
+        let streams = self.get_claim_candidates(handler_name).await?;
         
         let mut claimed_count = 0;
         
@@ -751,12 +665,9 @@ impl PostgresEventStore {
                 config
             ).await {
                 claimed_count += 1;
-                if self.should_log_debug() {
-                    debug!("Claimed stream {}/{} for handler {}", stream_name, stream_id, handler_name);
-                }
             }
-        }
-        
+            }
+       
         Ok(claimed_count)
     }
     
@@ -784,10 +695,6 @@ impl PostgresEventStore {
             return Ok(0);
         }
         
-        if self.should_log_debug() {
-            debug!("Processing {} claimed streams concurrently", claimed_count);
-        }
-        
         // Process each claimed stream concurrently
         let mut tasks = Vec::with_capacity(claimed_count);
         
@@ -796,10 +703,6 @@ impl PostgresEventStore {
             let stream_id: String = row.get("stream_id");
             let last_position: i64 = row.get("last_position");
             
-            if self.should_log_debug() {
-                debug!("Spawning task for claimed stream {}/{} from position {}", 
-                      stream_name, stream_id, last_position);
-            }
             
             // Clone the necessary components for the task
             let store_clone = self.clone();
@@ -827,10 +730,6 @@ impl PostgresEventStore {
                         &config_clone
                     ).await {
                         Ok(position) => {
-                            if store_clone.should_log_debug() {
-                                debug!("Successfully processed stream {}/{} up to position {}",
-                                    stream_name_clone, stream_id_clone, position);
-                            }
                             
                             if let Err(e) = store_clone.update_stream_claim_success(
                                 &stream_name_clone,
@@ -890,6 +789,7 @@ impl PostgresEventStore {
         Ok(processed_count)
     }
 }
+
 
 #[async_trait]
 impl EventStore for PostgresEventStore {
@@ -1019,17 +919,21 @@ impl EventStore for PostgresEventStore {
         
         trace!(event_count = events.len(), "Command generated events");
 
-        let next_position = last_position.unwrap_or(-1) + 1;
+        // For new streams, start at position 1 instead of 0
+        let next_position = last_position.unwrap_or(0) + 1;
         
         let store_span = info_span!("store_events", next_position = next_position, event_count = events.len());
         let _store_guard = store_span.enter();
 
         let mut tx = self.pool.begin().await?;
         let mut final_global_position = 0;
+        let mut final_stream_position = next_position;
+        let mut created_events = Vec::with_capacity(events.len());
 
         for (idx, event) in events.into_iter().enumerate() {
             let event_json = serde_json::to_value(&event)?;
             let stream_position = next_position + idx as i64;
+            final_stream_position = stream_position;
             let id = Uuid::new_v4();
             
             let event_span = info_span!(
@@ -1044,7 +948,7 @@ impl EventStore for PostgresEventStore {
                 r#"
                 INSERT INTO events (id, stream_name, stream_id, event_data, metadata, stream_position)
                 VALUES ($1, $2, $3, $4, $5, $6)
-                RETURNING global_position
+                RETURNING global_position, id, created_at
                 "#,
             )
             .bind(id.to_string())
@@ -1057,25 +961,37 @@ impl EventStore for PostgresEventStore {
             .await?;
 
             final_global_position = row.get("global_position");
+            
+            // Create an EventRow for this event
+            let created_event = EventRow {
+                id: row.get("id"),
+                stream_name: stream_name.to_string(),
+                stream_id: stream_id.to_string(),
+                event_data: event_json.clone(),
+                metadata: metadata.clone(),
+                stream_position,
+                global_position: final_global_position,
+                created_at: row.get("created_at"),
+            };
+            
+            created_events.push(created_event);
             trace!(global_position = final_global_position, "Event stored");
         }
-
-        // Notify listeners of new events
-        sqlx::query("SELECT pg_notify('new_event', $1)")
-            .bind(final_global_position.to_string())
-            .execute(&mut *tx)
-            .await?;
             
+        // Commit the transaction - notification will happen automatically via database trigger
         tx.commit().await?;
         
         info!(
             global_position = final_global_position,
+            events_count = created_events.len(),
             "Command executed successfully"
         );
 
         Ok(CommandResult {
             stream_id,
             global_position: final_global_position,
+            stream_position: final_stream_position,
+            events: created_events,
         })
     }
     
@@ -1286,114 +1202,5 @@ impl EventStore for PostgresEventStore {
         })
     }
     
-    async fn replay_dead_letter_event(&self, dead_letter_id: &str) -> Result<()> {
-        // Start a transaction
-        let mut tx = self.pool.begin().await?;
-        
-        // Get the dead letter event
-        let dead_letter = sqlx::query(
-            r#"
-            SELECT 
-                id, event_id, stream_name, stream_id, handler_name,
-                error_message, retry_count, event_data, stream_position
-            FROM dead_letter_events
-            WHERE id = $1
-            "#
-        )
-        .bind(dead_letter_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| anyhow!("Dead letter event not found: {}", dead_letter_id))?;
-        
-        let stream_name = dead_letter.get::<String, _>("stream_name");
-        let stream_id = dead_letter.get::<String, _>("stream_id");
-        let handler_name = dead_letter.get::<String, _>("handler_name");
-        let position = dead_letter.get::<i64, _>("stream_position");
-        
-        Span::current()
-            .record("stream_name", &stream_name.as_str())
-            .record("stream_id", &stream_id.as_str())
-            .record("handler_name", &handler_name.as_str())
-            .record("stream_position", &position);
-        
-        // Verify the original event still exists
-        let original_event = sqlx::query(
-            r#"
-            SELECT id FROM events
-            WHERE stream_name = $1 AND stream_id = $2 AND stream_position = $3
-            "#
-        )
-        .bind(&stream_name)
-        .bind(&stream_id)
-        .bind(position)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| anyhow!("Original event no longer exists"))?;
-        
-        // Reset the processing claim for this stream/handler
-        sqlx::query(
-            r#"
-            UPDATE event_processing_claims
-            SET 
-                last_position = $1 - 1, -- Set to before the failed event position
-                error_count = 0,
-                last_error = NULL,
-                next_retry_at = NULL,
-                claimed_by = NULL,
-                claim_expires_at = NULL,
-                last_updated_at = now()
-            WHERE 
-                stream_name = $2 AND 
-                stream_id = $3 AND 
-                handler_name = $4
-            "#
-        )
-        .bind(position)
-        .bind(&stream_name)
-        .bind(&stream_id)
-        .bind(&handler_name)
-        .execute(&mut *tx)
-        .await?;
-        
-        // Delete the dead letter event
-        sqlx::query("DELETE FROM dead_letter_events WHERE id = $1")
-            .bind(dead_letter_id)
-            .execute(&mut *tx)
-            .await?;
-            
-        // Commit the transaction
-        tx.commit().await?;
-        
-        info!("Replayed dead letter event");
-        
-        // Notify of a new event to trigger processing
-        sqlx::query("SELECT pg_notify('new_event', '0')")
-            .execute(&self.pool)
-            .await?;
-        
-        Ok(())
-    }
-    
-    async fn delete_dead_letter_event(&self, dead_letter_id: &str) -> Result<()> {
-        // Check if the dead letter event exists
-        let exists = sqlx::query("SELECT 1 FROM dead_letter_events WHERE id = $1")
-            .bind(dead_letter_id)
-            .fetch_optional(&self.pool)
-            .await?
-            .is_some();
-            
-        if !exists {
-            return Err(anyhow!("Dead letter event not found: {}", dead_letter_id));
-        }
-        
-        // Delete the dead letter event
-        sqlx::query("DELETE FROM dead_letter_events WHERE id = $1")
-            .bind(dead_letter_id)
-            .execute(&self.pool)
-            .await?;
-            
-        info!("Deleted dead letter event: {}", dead_letter_id);
-        
-        Ok(())
-    }
+  
 } 

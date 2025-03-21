@@ -3,9 +3,13 @@ use anyhow::{Result, anyhow};
 use sqlx::{postgres::PgPool, Row};
 use tracing::{info, error, debug, instrument, Span, trace, info_span};
 use serde_json::{self, Value as JsonValue, json};
+use serde::{Serialize, Deserialize};
+use std::collections::HashMap;
 use uuid::Uuid;
 use tokio::time::sleep;
 use async_trait::async_trait;
+use std::sync::Arc;
+use chrono::{DateTime, Utc};
 
 use crate::{
     store::view_store::ViewStore,
@@ -13,6 +17,56 @@ use crate::{
     view::View,
     event_handler::EventRow,
 };
+
+/// Type to track stream positions in a type-safe way
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct StreamPositions {
+    positions: HashMap<String, i64>,
+}
+
+impl StreamPositions {
+    /// Create a new empty StreamPositions
+    pub fn new() -> Self {
+        Self {
+            positions: HashMap::new(),
+        }
+    }
+    
+    /// Get position for a stream
+    pub fn get_position(&self, stream_name: &str, stream_id: &str) -> Option<i64> {
+        let key = format!("{}:{}", stream_name, stream_id);
+        self.positions.get(&key).copied()
+    }
+    
+    /// Set position for a stream
+    pub fn set_position(&mut self, stream_name: &str, stream_id: &str, position: i64) {
+        let key = format!("{}:{}", stream_name, stream_id);
+        self.positions.insert(key, position);
+    }
+    
+    /// Convert from raw JSONB Value
+    pub fn from_json(json: JsonValue) -> Result<Self> {
+        // If it's already in our struct format, deserialize directly
+        if let Ok(positions) = serde_json::from_value::<Self>(json.clone()) {
+            return Ok(positions);
+        }
+        
+        // Otherwise, handle the legacy format (a plain JSON object)
+        let mut result = Self::new();
+        
+        if let Some(obj) = json.as_object() {
+            for (key, value) in obj {
+                if let Some(pos_str) = value.as_str() {
+                    if let Ok(pos) = pos_str.parse::<i64>() {
+                        result.positions.insert(key.clone(), pos);
+                    }
+                }
+            }
+        }
+        
+        Ok(result)
+    }
+}
 
 /// PostgreSQL-based view store implementation
 #[derive(Clone)]
@@ -103,35 +157,32 @@ impl ViewStore for PostgresViewStore {
         );
         let _guard = span.enter();
         
-        // Create a unique key for this stream
-        let stream_key = Self::get_stream_key(&event_row.stream_name, &event_row.stream_id);
-        
-        trace!(stream_key = %stream_key, "Checking if event is already processed");
+        trace!("Checking if event is already processed");
         
         // Check if we have already processed this event for this stream
         let row = sqlx::query(
-            "SELECT processed_stream_positions->>$3 as stream_position
+            "SELECT processed_stream_positions
              FROM view_snapshots 
              WHERE view_name = $1 
              AND partition_key = $2"
         )
         .bind(V::name())
         .bind(partition_key)
-        .bind(&stream_key)
         .fetch_optional(&self.pool)
         .await?;
 
         if let Some(row) = row {
-            if let Some(position_str) = row.get::<Option<String>, _>("stream_position") {
-                if let Ok(last_position) = position_str.parse::<i64>() {
-                    // If the event's position is less than or equal to what we've already processed, skip it
-                    if event_row.stream_position <= last_position {
-                        debug!(
-                            last_processed_position = last_position,
-                            "Event already processed"
-                        );
-                        return Ok(true);
-                    }
+            let positions_json: JsonValue = row.get("processed_stream_positions");
+            let positions = StreamPositions::from_json(positions_json)?;
+            
+            if let Some(last_position) = positions.get_position(&event_row.stream_name, &event_row.stream_id) {
+                // If the event's position is less than or equal to what we've already processed, skip it
+                if event_row.stream_position <= last_position {
+                    debug!(
+                        last_processed_position = last_position,
+                        "Event already processed"
+                    );
+                    return Ok(true);
                 }
             }
         }
@@ -167,19 +218,58 @@ impl ViewStore for PostgresViewStore {
             "Saving view state"
         );
         
-        // We need to update the processed_stream_positions object with the new stream position
-        // Using PostgreSQL's jsonb_set function for this
+        // Check if there's an existing record to get current positions
+        let existing_row = sqlx::query(
+            "SELECT processed_stream_positions 
+             FROM view_snapshots 
+             WHERE view_name = $1 AND partition_key = $2"
+        )
+        .bind(V::name())
+        .bind(partition_key)
+        .fetch_optional(&self.pool)
+        .await?;
+        
+        // Initialize our positions, either from existing data or as new
+        let mut positions = if let Some(row) = existing_row {
+            let positions_json: JsonValue = row.get("processed_stream_positions");
+            let positions = StreamPositions::from_json(positions_json)?;
+            debug!(
+                stream_name = %event_row.stream_name,
+                stream_id = %event_row.stream_id,
+                "Loaded existing positions: {:?}", positions
+            );
+            positions
+        } else {
+            debug!("No existing positions found, creating new");
+            StreamPositions::new()
+        };
+        
+        // Update with the new position
+        let prev_position = positions.get_position(&event_row.stream_name, &event_row.stream_id);
+        positions.set_position(&event_row.stream_name, &event_row.stream_id, event_row.stream_position);
+        
+        debug!(
+            prev_position = ?prev_position,
+            new_position = event_row.stream_position,
+            stream_name = %event_row.stream_name,
+            stream_id = %event_row.stream_id,
+            "Updated stream position"
+        );
+        
+        // Serialize positions
+        let positions_json = serde_json::to_value(&positions)?;
+        
+        // Now do the upsert with our prepared positions
         sqlx::query(
             r#"
             INSERT INTO view_snapshots 
             (id, view_name, partition_key, state, last_processed_global_position, processed_stream_positions)
-            VALUES ($1, $2, $3, $4, $5, jsonb_build_object($6, $7::text))
+            VALUES ($1, $2, $3, $4, $5, $6)
             ON CONFLICT (view_name, partition_key) 
             DO UPDATE SET 
                 state = $4, 
                 last_processed_global_position = $5,
-                processed_stream_positions = 
-                    view_snapshots.processed_stream_positions || jsonb_build_object($6, $7::text)
+                processed_stream_positions = $6
             "#
         )
         .bind(&id)
@@ -187,8 +277,7 @@ impl ViewStore for PostgresViewStore {
         .bind(partition_key)
         .bind(&state_json)
         .bind(event_row.global_position)
-        .bind(&stream_key)
-        .bind(event_row.stream_position.to_string())
+        .bind(&positions_json)
         .execute(&self.pool)
         .await?;
 
@@ -354,76 +443,204 @@ impl ViewStore for PostgresViewStore {
         Ok(res.items)
     }
     
-    async fn wait_for_view<V: View + Default>(
-        &self, 
-        partition_key: &str, 
-        target_position: i64, 
-        timeout_ms: u64
+    /// Get the state of a view for a specific stream
+    async fn get_view_state_by_stream<V: View + Default>(
+        &self,
+        stream_name: &str,
+        stream_id: &str, 
+        partition_key: &str
+    ) -> Result<Option<V>> {
+        let view_span = info_span!(
+            "get_view_state_by_stream", 
+            view_name = %V::name(), 
+            stream_name = %stream_name,
+            stream_id = %stream_id,
+            partition_key = %partition_key
+        );
+        let _guard = view_span.enter();
+        
+        // First get the view state
+        let view = self.get_view_state::<V>(partition_key).await?;
+        
+        // Then check if it belongs to the specified stream
+        if let Some(view) = view {
+            debug!("Retrieved view state by stream");
+            Ok(Some(view))
+        } else {
+            debug!("View state not found for stream");
+            Ok(None)
+        }
+    }
+    
+    /// Save a view state with a stream position
+    async fn save_view_state_with_position<V: View + Default>(
+        &self,
+        stream_name: &str,
+        stream_id: &str,
+        partition_key: &str,
+        state: &V,
+        position: i64,
     ) -> Result<()> {
         let span = info_span!(
-            "wait_for_view",
+            "save_view_state_with_position",
             view_name = %V::name(),
             partition_key = %partition_key,
-            target_position = target_position,
-            timeout_ms = timeout_ms
+            stream_name = %stream_name,
+            stream_id = %stream_id,
+            position = position
         );
         let _guard = span.enter();
         
-        let start = Instant::now();
-        let timeout = Duration::from_millis(timeout_ms);
-        let view_name = V::name();
+        let state_json = serde_json::to_value(state)?;
+        let id = Uuid::new_v4().to_string();
         
-        info!("Waiting for view to reach position");
+        // Check if there's an existing record to get current positions
+        let existing_row = sqlx::query(
+            "SELECT processed_stream_positions 
+             FROM view_snapshots 
+             WHERE view_name = $1 AND partition_key = $2"
+        )
+        .bind(V::name())
+        .bind(partition_key)
+        .fetch_optional(&self.pool)
+        .await?;
+        
+        // Initialize our positions, either from existing data or as new
+        let mut positions = if let Some(row) = existing_row {
+            let positions_json: JsonValue = row.get("processed_stream_positions");
+            let positions = StreamPositions::from_json(positions_json)?;
+            debug!(
+                stream_name = %stream_name,
+                stream_id = %stream_id,
+                "Loaded existing positions: {:?}", positions
+            );
+            positions
+        } else {
+            debug!("No existing positions found, creating new");
+            StreamPositions::new()
+        };
+        
+        // Update with the new position
+        positions.set_position(stream_name, stream_id, position);
+        
+        // Serialize positions
+        let positions_json = serde_json::to_value(&positions)?;
+        
+        // Do the upsert with our prepared positions
+        sqlx::query(
+            r#"
+            INSERT INTO view_snapshots 
+            (id, view_name, partition_key, state, last_processed_global_position, processed_stream_positions)
+            VALUES ($1, $2, $3, $4, 0, $5)
+            ON CONFLICT (view_name, partition_key) 
+            DO UPDATE SET 
+                state = $4, 
+                processed_stream_positions = $5
+            "#
+        )
+        .bind(&id)
+        .bind(V::name())
+        .bind(partition_key)
+        .bind(&state_json)
+        .bind(&positions_json)
+        .execute(&self.pool)
+        .await?;
+
+        debug!("View state saved successfully with position");
+        Ok(())
+    }
+    
+    /// Get the position of a view
+    async fn get_view_state_position<V: View + Default>(
+        &self,
+        partition_key: &str,
+        stream_name: &str,
+        stream_id: &str,
+    ) -> Result<Option<i64>> {
+        let span = info_span!(
+            "get_view_state_position",
+            view_name = %V::name(),
+            partition_key = %partition_key,
+            stream_name = %stream_name,
+            stream_id = %stream_id
+        );
+        let _guard = span.enter();
+        
+        // Get the processed_stream_positions for this view
+        let row = sqlx::query(
+            "SELECT processed_stream_positions
+             FROM view_snapshots 
+             WHERE view_name = $1 AND partition_key = $2"
+        )
+        .bind(V::name())
+        .bind(partition_key)
+        .fetch_optional(&self.pool)
+        .await?;
+        
+        if let Some(row) = row {
+            let positions_json: JsonValue = row.get("processed_stream_positions");
+            let positions = StreamPositions::from_json(positions_json)?;
+            
+            if let Some(position) = positions.get_position(stream_name, stream_id) {
+                debug!(position, "Found position for stream");
+                return Ok(Some(position));
+            }
+        }
+        
+        debug!("No position found for stream");
+        Ok(None)
+    }
+    
+    /// Wait for a view to catch up to a specific event
+    async fn wait_for_view<V: View + Default>(
+        &self,
+        event: &EventRow,
+        partition_key: &str,
+        timeout_ms: u64,
+    ) -> Result<()> {
+        let stream_name = &event.stream_name;
+        let stream_id = &event.stream_id;
+        let position = event.stream_position;
+        
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_millis(timeout_ms);
+        
+        debug!(
+            "Waiting for view {} to catch up to event in stream {}/{} at position {}",
+            partition_key, stream_name, stream_id, position
+        );
         
         loop {
-            let elapsed = start.elapsed();
-            Span::current().record("elapsed_ms", elapsed.as_millis() as i64);
-            
-            // Check if the view has processed up to our target position
-            let row = sqlx::query(
-                "SELECT last_processed_global_position 
-                 FROM view_snapshots 
-                 WHERE view_name = $1 AND partition_key = $2"
-            )
-            .bind(view_name.clone())
-            .bind(partition_key)
-            .fetch_optional(&self.pool)
-            .await?;
+            if start.elapsed() > timeout {
+                return Err(anyhow!(
+                    "Timeout waiting for view {} to catch up to position {} for stream {}/{}",
+                    partition_key, position, stream_name, stream_id
+                ));
+            }
 
-            // Return success if target position has been reached
-            if let Some(row) = row {
-                let last_position: i64 = row.get("last_processed_global_position");
-                Span::current().record("current_position", last_position);
-                
-                if last_position >= target_position {
-                    info!(current_position = last_position, "View reached target position");
+            let state = self.get_view_state_position::<V>(
+                partition_key,
+                stream_name,
+                stream_id,
+            ).await?;
+            
+            debug!(
+                "Waiting for view {} to catch up: current_position={:?}, target_position={}",
+                partition_key, state, position
+            );
+            
+            match state {
+                Some(current_position) if current_position >= position => {
+                    debug!(
+                        "View {} caught up to position {} for stream {}/{}",
+                        partition_key, position, stream_name, stream_id
+                    );
                     return Ok(());
                 }
-                
-                trace!(current_position = last_position, "View not yet at target position");
-            } else {
-                debug!("View not found yet");
+                _ => {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                }
             }
-
-            // Check for timeout
-            if start.elapsed() > timeout {
-                // Check if target event exists for better error diagnosis
-                let event_exists = sqlx::query("SELECT 1 FROM events WHERE global_position = $1")
-                    .bind(target_position)
-                    .fetch_optional(&self.pool)
-                    .await?
-                    .is_some();
-                
-                Span::current().record("event_exists", event_exists);
-                
-                error!(
-                    elapsed_ms = start.elapsed().as_millis() as i64,
-                    "Timeout waiting for view to catch up"
-                );
-                return Err(anyhow!("Timeout waiting for view to catch up"));
-            }
-
-            sleep(Duration::from_millis(50)).await;
         }
     }
 } 
