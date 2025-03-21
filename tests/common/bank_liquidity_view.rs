@@ -1,7 +1,5 @@
 use ask_cqrs::view::View;
 use serde::{Deserialize, Serialize};
-use crate::common::bank_account::BankAccountAggregate;
-use ask_cqrs::aggregate::Aggregate;
 use std::collections::HashSet;
 
 use super::bank_account::BankAccountEvent;

@@ -199,23 +199,8 @@ async fn test_view_query_pagination() -> Result<(), anyhow::Error> {
     
     // Generate unique user IDs
     let user_id1 = Uuid::new_v4().to_string();
-    let user_id2 = Uuid::new_v4().to_string();
 
-    // Create a custom event for these specific tests that we can use with wait_for_view
-    let create_event = |stream_id: &str| -> EventRow {
-        EventRow {
-            id: Uuid::new_v4().to_string(),
-            stream_name: "bank_account".to_string(),
-            stream_id: stream_id.to_string(),
-            event_data: json!({}),
-            metadata: json!({}),
-            stream_position: 1,
-            global_position: 1,
-            created_at: Utc::now(),
-        }
-    };
-
-    // Create accounts
+       // Create accounts
     let result1 = store.execute_command::<BankAccountAggregate>(
         BankAccountCommand::OpenAccount { 
             user_id: user_id1.clone(),
