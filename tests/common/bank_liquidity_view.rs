@@ -2,6 +2,7 @@ use ask_cqrs::view::View;
 use serde::{Deserialize, Serialize};
 use crate::common::bank_account::BankAccountAggregate;
 use ask_cqrs::aggregate::Aggregate;
+use std::collections::HashSet;
 
 use super::bank_account::BankAccountEvent;
 use ask_cqrs::event_handler::EventRow;
@@ -11,6 +12,8 @@ use ask_cqrs::event_handler::EventRow;
 pub struct BankLiquidityView {
     pub total_balance: u64,
     pub total_accounts: u64,
+    #[serde(default)]
+    tracked_accounts: HashSet<String>,
 }
 
 impl Default for BankLiquidityView {
@@ -18,6 +21,7 @@ impl Default for BankLiquidityView {
         Self {
             total_balance: 0,
             total_accounts: 0,
+            tracked_accounts: HashSet::new(),
         }
     }
 }
@@ -25,8 +29,8 @@ impl Default for BankLiquidityView {
 impl View for BankLiquidityView {
     type Event = BankAccountEvent;
 
-    fn name() -> String {
-        "bank_liquidity_view".to_string()
+    fn name() -> &'static str {
+        "bank_liquidity_view"
     }
 
 
@@ -40,8 +44,11 @@ impl View for BankLiquidityView {
 
     fn apply_event(&mut self, event: &Self::Event, _event_row: &EventRow) {
         match event {
-            BankAccountEvent::AccountOpened { .. } => {
-                self.total_accounts += 1;
+            BankAccountEvent::AccountOpened { account_id, .. } => {
+                // Only increment total_accounts if this is a new account we haven't seen before
+                if self.tracked_accounts.insert(account_id.clone()) {
+                    self.total_accounts += 1;
+                }
             }
             BankAccountEvent::FundsDeposited { amount, .. } => {
                 self.total_balance += amount;

@@ -40,6 +40,6 @@ pub async fn create_test_store() -> Result<ask_cqrs::store::postgres_event_store
 
 pub fn initialize_logger() {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("info")
+        .with_env_filter("info,ask_cqrs::view_event_handler=debug,ask_cqrs::store::postgres_view_store=debug")
         .try_init();
 } 

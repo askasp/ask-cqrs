@@ -24,8 +24,8 @@ impl Default for BankAccountView {
 impl View for BankAccountView {
     type Event = BankAccountEvent;
 
-    fn name() -> String {
-        "bank_account_view".to_string()
+    fn name() -> &'static str {
+        "bank_account_view"
     }
 
 

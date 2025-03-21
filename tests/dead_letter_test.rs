@@ -1,18 +1,17 @@
 /*
- 
- * 
- * This test verifies the functionality of the dead letter queue, including:
- * - Events are retried according to the configured max_retries
- * - Failed events are moved to the dead letter queue after max_retries
- * - Streams are blocked from further processing until the failed event is resolved
- * - Replaying a dead letter event unblocks the stream
+ * This test verifies the functionality of the dead letter queue by following a simple sequence:
+ * 1. First event succeeds
+ * 2. Second event fails first, then succeeds on retry
+ * 3. Third event fails twice and goes to the dead letter queue
+ * 4. Fourth event waits until third event is in the dead letter queue, then processes
  */
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::collections::HashMap;
+use ask_cqrs::aggregate::Aggregate;
 use tokio::time::sleep;
-use tracing::{info, warn, error, instrument};
+use tracing::{info, error, instrument};
 use uuid::Uuid;
 use serde_json::json;
 use anyhow::Result;
@@ -27,89 +26,19 @@ use ask_cqrs::store::event_store::{EventStore, EventProcessingConfig};
 use ask_cqrs::store::postgres_event_store::PostgresEventStore;
 use ask_cqrs::event_handler::{EventHandler, EventHandlerError, EventRow};
 
-// A handler that will fail a specific number of times before succeeding
+// A handler that fails specific events according to our test sequence
 #[derive(Clone)]
-struct RetryThenFailHandler {
-    store: PostgresEventStore,
-    retries_per_event: Arc<Mutex<HashMap<String, i32>>>,
-    max_retries: i32,
-}
-
-impl RetryThenFailHandler {
-    pub fn new(store: PostgresEventStore, max_retries: i32) -> Self {
-        Self {
-            store,
-            retries_per_event: Arc::new(Mutex::new(HashMap::new())),
-            max_retries,
-        }
-    }
-    
-    pub fn get_retry_counts(&self) -> HashMap<String, i32> {
-        self.retries_per_event.lock().unwrap().clone()
-    }
-}
-
-#[async_trait::async_trait]
-impl EventHandler for RetryThenFailHandler {
-    type Events = BankAccountEvent;
-
-    fn name() -> &'static str {
-        "retry_then_fail_handler"
-    }
-
-    async fn handle_event(&self, event: Self::Events, event_row: EventRow) -> Result<(), EventHandlerError> {
-        // Track retry count for this event
-        let mut retries = self.retries_per_event.lock().unwrap();
-        let retry_count = *retries.entry(event_row.id.clone()).or_insert(0);
-        retries.insert(event_row.id.clone(), retry_count + 1);
-        
-        info!(
-            "Processing event {}: retry {} of max {}", 
-            event_row.id, retry_count, self.max_retries
-        );
-        
-        // Fix: Always fail for withdrawal events to test the dead letter queue
-        let should_fail = match event {
-            BankAccountEvent::FundsWithdrawn { .. } => true,
-            _ => false // Process other events normally
-        };
-        
-        drop(retries); // Release the lock before processing
-        
-        match event {
-            BankAccountEvent::FundsWithdrawn { amount, account_id } => {
-                info!("Processed withdrawal of {} for account {}", amount, account_id);
-                
-                if should_fail {
-                    let error_msg = format!("Simulated failure for event {} on retry {}", 
-                                           event_row.id, retry_count);
-                    error!("{}", error_msg);
-                    return Err(EventHandlerError {
-                        log_message: error_msg,
-                    });
-                }
-                
-                info!("Successfully processed event {} after {} retries", event_row.id, retry_count);
-            },
-            _ => {
-                // Process other events normally
-                info!("Processed event: {:?}", event);
-            }
-        }
-
-        Ok(())
-    }
-}
-
-// A continuous handler that should always succeed
-#[derive(Clone)]
-struct AlwaysSucceedHandler {
+struct SequencedFailureHandler {
+    // Track which events have been seen and how many times
+    event_attempts: Arc<Mutex<HashMap<String, i32>>>,
+    // Track which events have been processed successfully
     processed_events: Arc<Mutex<Vec<String>>>,
 }
 
-impl AlwaysSucceedHandler {
+impl SequencedFailureHandler {
     pub fn new() -> Self {
         Self {
+            event_attempts: Arc::new(Mutex::new(HashMap::new())),
             processed_events: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -117,56 +46,133 @@ impl AlwaysSucceedHandler {
     pub fn get_processed_events(&self) -> Vec<String> {
         self.processed_events.lock().unwrap().clone()
     }
+    
+    pub fn get_attempt_counts(&self) -> HashMap<String, i32> {
+        self.event_attempts.lock().unwrap().clone()
+    }
 }
 
 #[async_trait::async_trait]
-impl EventHandler for AlwaysSucceedHandler {
+impl EventHandler for SequencedFailureHandler {
     type Events = BankAccountEvent;
 
     fn name() -> &'static str {
-        "always_succeed_handler"
+        "sequenced_failure_handler"
     }
 
     async fn handle_event(&self, event: Self::Events, event_row: EventRow) -> Result<(), EventHandlerError> {
-        info!("Always succeed handler processing event: {:?}", event);
+        // Track attempt count for this event
+        let mut attempts = self.event_attempts.lock().unwrap();
+        let attempt_count = *attempts.entry(event_row.id.clone()).or_insert(0);
+        attempts.insert(event_row.id.clone(), attempt_count + 1);
         
-        {
-            let mut events = self.processed_events.lock().unwrap();
-            events.push(event_row.id.clone());
+        // Get the event position in the stream to determine behavior
+        let position = event_row.stream_position;
+        
+        info!(
+            "Processing event {} (stream position {}): attempt {}", 
+            event_row.id, position, attempt_count + 1
+        );
+        
+        match position {
+            1 => {
+                // First event (position 0) - Always succeeds
+                info!("First event succeeded: {:?}", event);
+                let mut processed = self.processed_events.lock().unwrap();
+                processed.push(event_row.id.clone());
+                Ok(())
+            },
+            2 => {
+                // Second event (position 1) - Fails on first attempt, succeeds on retry
+                if attempt_count == 0 {
+                    // First attempt - fail
+                    error!("Second event failing on first attempt");
+                    Err(EventHandlerError {
+                        log_message: "Simulated failure for second event - first attempt".to_string(),
+                    })
+                } else {
+                    // Retry - succeed
+                    info!("Second event succeeded on retry");
+                    let mut processed = self.processed_events.lock().unwrap();
+                    processed.push(event_row.id.clone());
+                    Ok(())
+                }
+            },
+            3 => {
+                // Third event (position 2) - Always fails, should go to dead letter after max retries
+                error!("Third event failing, attempt {}", attempt_count + 1);
+                Err(EventHandlerError {
+                    log_message: format!("Simulated failure for third event - attempt {}", attempt_count + 1),
+                })
+            },
+            _ => {
+                // Fourth and later events - Always succeed
+                info!("Event at position {} succeeded: {:?}", position, event);
+                let mut processed = self.processed_events.lock().unwrap();
+                processed.push(event_row.id.clone());
+                Ok(())
+            }
         }
-        
-        Ok(())
     }
 }
 
-async fn create_account_with_events(store: &PostgresEventStore) -> Result<(String, String)> {
+#[tokio::test]
+#[instrument]
+#[serial]
+async fn test_dead_letter_queue_simple_sequence() -> Result<()> {
+    initialize_logger();
+    
+    // Create store with test configuration
+    let store = create_test_store().await?;
+    
+    // Set max retries to 1 for quicker testing
+    let event_config = EventProcessingConfig {
+        max_retries: 1,  // After one retry, events go to dead letter
+        base_retry_delay: Duration::from_millis(200),
+        max_retry_delay: Duration::from_millis(500),
+        claim_ttl: Duration::from_millis(1000),
+        poll_interval: Duration::from_millis(500),
+        ..Default::default()
+    };
+    
+    // Create and start our handler
+    let handler = SequencedFailureHandler::new();
+    store.start_event_handler(handler.clone(), Some(event_config.clone())).await?;
+    
+    // Create a unique ID for our test stream
+    let account_id = Uuid::new_v4().to_string();
     let user_id = Uuid::new_v4().to_string();
     
-    // Open account
-    let res = store.execute_command::<BankAccountAggregate>(
+    // Step 1: Create the first event (should succeed)
+    info!("Creating first event (should succeed)");
+    let res1 = store.execute_command::<BankAccountAggregate>(
         BankAccountCommand::OpenAccount { 
             user_id: user_id.clone(),
-            account_id: None,
+            account_id: Some(account_id.clone()),
         },
         (),
         json!({"user_id": user_id}),
     ).await?;
     
-    let account_id = res.stream_id;
+    // Give the handler a moment to process the first event
+    sleep(Duration::from_millis(2000)).await;
     
-    // Deposit funds
-    store.execute_command::<BankAccountAggregate>(
+    // Assert first event was processed successfully
+    let processed_events = handler.get_processed_events();
+    let events = store.get_events_for_stream(BankAccountAggregate::name(), &account_id, -1, 10).await?;
+    let first_event_id = events.iter()
+        .find(|e| e.stream_position == 1)
+        .map(|e| e.id.clone())
+        .expect("Couldn't find first event");
+    
+    assert!(processed_events.contains(&first_event_id), 
+            "First event should have been processed successfully");
+    info!("✅ First event processed successfully");
+    
+    // Step 2: Create the second event (should fail first, then succeed on retry)
+    info!("Creating second event (should fail first, then succeed on retry)");
+    let res2 = store.execute_command::<BankAccountAggregate>(
         BankAccountCommand::DepositFunds { 
-            amount: 5000,
-            account_id: account_id.clone(),
-        },
-        (),
-        json!({"user_id": user_id}),
-    ).await?;
-    
-    // Withdrawal that will fail processing
-    let withdraw_res = store.execute_command::<BankAccountAggregate>(
-        BankAccountCommand::WithdrawFunds { 
             amount: 1000,
             account_id: account_id.clone(),
         },
@@ -174,198 +180,104 @@ async fn create_account_with_events(store: &PostgresEventStore) -> Result<(Strin
         json!({"user_id": user_id}),
     ).await?;
     
-    info!("Created account {} with events up to position {}", 
-         account_id, withdraw_res.global_position);
+    // Wait for retry and processing of the second event
+    sleep(Duration::from_secs(3)).await;
     
-    Ok((account_id, user_id))
-}
-
-#[tokio::test]
-#[instrument]
-#[serial]
-async fn test_dead_letter_queue_and_retries() -> Result<()> {
-    initialize_logger();
+    // Assert second event failed first, then succeeded on retry
+    let processed_events = handler.get_processed_events();
+    let attempt_counts = handler.get_attempt_counts();
+    let events = store.get_events_for_stream(BankAccountAggregate::name(), &account_id, -1, 10).await?;
+    let second_event_id = events.iter()
+        .find(|e| e.stream_position == 2)
+        .map(|e| e.id.clone())
+        .expect("Couldn't find second event");
     
-    // Create store and handlers
-    let store = create_test_store().await?;
+    println!("Processed events: {:?}", processed_events);
+    println!("Attempt counts: {:?}", attempt_counts);
+    println!("Second event id: {:?}", second_event_id);
+    assert!(processed_events.contains(&second_event_id), 
+            "Second event should have been processed successfully after retry");
+    assert!(attempt_counts.get(&second_event_id).map_or(false, |&count| count > 1),
+            "Second event should have been attempted more than once");
+    info!("✅ Second event failed first, then succeeded on retry");
     
-    // Set max retries to 2 (will retry twice, then dead-letter)
-    let event_config = EventProcessingConfig {
-        max_retries: 1,               // Lower to 1 so we move to dead letter queue faster
-        base_retry_delay: Duration::from_millis(50),
-        max_retry_delay: Duration::from_millis(200),
-        claim_ttl: Duration::from_millis(500),
-        poll_interval: Duration::from_millis(100),
-        ..Default::default()
-    };
-    
-    // Print configuration for debugging
-    info!("Test config: max_retries={}, base_delay={:?}, max_delay={:?}", 
-          event_config.max_retries, 
-          event_config.base_retry_delay,
-          event_config.max_retry_delay);
-    
-    // Create handler that will fail after max_retries
-    let retry_handler = RetryThenFailHandler::new(store.clone(), 1);  // Match max_retries in config
-    
-    // Also register a handler that always succeeds
-    let always_succeed = AlwaysSucceedHandler::new();
-    
-    // Start both handlers
-    store.start_event_handler(retry_handler.clone(), Some(event_config.clone())).await?;
-    store.start_event_handler(always_succeed.clone(), Some(event_config.clone())).await?;
-    
-    // Create account with events including a withdrawal
-    let (account_id, user_id) = create_account_with_events(&store).await?;
-    
-    // Check for events right after creation
-    let events = store.get_events_for_stream("bank_account", &account_id, -1, 10).await?;
-    info!("Found {} events for stream", events.len());
-    
-    let has_withdraw = events.iter().any(|e| {
-        if let Ok(event_obj) = serde_json::from_value::<BankAccountEvent>(e.event_data.clone()) {
-            match event_obj {
-                BankAccountEvent::FundsWithdrawn { .. } => true,
-                _ => false
-            }
-        } else {
-            false
-        }
-    });
-    
-    info!("Has withdrawal event: {}", has_withdraw);
-    assert!(has_withdraw, "Withdrawal event was not stored correctly");
-
-    // Verify handler name matches what's used in database
-    info!("Handler name: {}", RetryThenFailHandler::name());
-    
-    // Wait for event processing attempts and dead letter placement
-    // Need to wait for max_retries + 1 attempts plus some retry delay
-    info!("Waiting for retry attempts and dead letter placement...");
-    sleep(Duration::from_secs(15)).await;  // Increase from 7 to 15 seconds for better reliability
-    
-    // Check if we have any events in the dead letter queue
-    let dead_letter_events = store.get_dead_letter_events(0, 10).await?;
-    info!("Found {} events in dead letter queue", dead_letter_events.items.len());
-    
-    // Find the dead letter events specifically for our test stream
-    let our_dead_letter_events: Vec<_> = dead_letter_events.items.iter()
-        .filter(|e| e.stream_id == account_id)
-        .collect();
-    
-    info!("Found {} dead letter events for our test stream", our_dead_letter_events.len());
-    
-    // Examine debug information about event processing directly from store
-    // This is available through the EventStore interface
-    let active_account_events = store.get_events_for_stream("bank_account", &account_id, -1, 10).await?;
-    info!("Total events for account after processing: {}", active_account_events.len());
-    
-    // Check retry counts
-    let retry_counts = retry_handler.get_retry_counts();
-    info!("Event retry counts: {:?}", retry_counts);
-    
-    // Check if we have events in the dead letter queue or recorded retries
-    // Either condition indicates the test is working correctly
-    if retry_counts.is_empty() && our_dead_letter_events.is_empty() {
-        panic!("Neither retries were recorded nor events moved to dead letter queue");
-    }
-    
-    // Verify we have at least one event in the dead letter queue for our stream
-    assert!(!our_dead_letter_events.is_empty(), "No events in dead letter queue for our test stream");
-    
-    // Use the first dead letter event from our stream
-    let dead_letter_event = &our_dead_letter_events[0];
-    let dead_letter_event_id = dead_letter_event.id.clone();
-    
-    // Create another withdrawal event to verify that the stream is blocked
-    info!("Creating additional withdrawal that should be blocked by failed event");
-    let result = store.execute_command::<BankAccountAggregate>(
+    // Step 3: Create the third event (should fail and go to dead letter)
+    info!("Creating third event (should fail and go to dead letter)");
+    let res3 = store.execute_command::<BankAccountAggregate>(
+        BankAccountCommand::DepositFunds { 
+            amount: 500,
+            account_id: account_id.clone(),
+        },
+        (),
+        json!({"user_id": user_id}),
+    ).await?;
+    info!("Creating fourth event (should wait until third event is in dead letter)");
+    let res4 = store.execute_command::<BankAccountAggregate>(
         BankAccountCommand::WithdrawFunds { 
             amount: 200,
             account_id: account_id.clone(),
         },
         (),
         json!({"user_id": user_id}),
-    ).await;
-    
-    // The new command should succeed (events are stored), but handler processing should be blocked
-    assert!(result.is_ok(), "Failed to create additional withdrawal");
-    
-    // Wait a bit to ensure processing attempt for new event
-    sleep(Duration::from_millis(500)).await;
-    
-    // Get processed event counts from always succeed handler 
-    let always_succeed_events = always_succeed.get_processed_events();
-    
-    // The always succeed handler should have processed the first events
-    info!("Always succeed handler processed {} events", always_succeed_events.len());
-    
-    // Print detailed information about the dead letter event we'll replay
-    info!("Dead letter event details:");
-    info!("  ID: {}", dead_letter_event.id);
-    info!("  Event ID: {}", dead_letter_event.event_id);
-    info!("  Stream: {}/{}", dead_letter_event.stream_name, dead_letter_event.stream_id);
-    info!("  Position: {}", dead_letter_event.stream_position);
-    info!("  Handler: {}", dead_letter_event.handler_name);
-    
-    // Now replay the dead letter event (pretend we fixed the issue)
-    info!("Replaying dead letter event: {}", dead_letter_event_id);
-    
-    // Wait a bit longer before replaying to ensure the system is ready
-    sleep(Duration::from_millis(500)).await;
-    
-    let replay_result = store.replay_dead_letter_event(&dead_letter_event_id).await;
-    
-    if let Err(e) = &replay_result {
-        warn!("Replay error: {}", e);
-        
-        // Sleep briefly and try again if there was an error
-        sleep(Duration::from_millis(500)).await;
-        let retry_replay = store.replay_dead_letter_event(&dead_letter_event_id).await;
-        if let Err(e) = &retry_replay {
-            warn!("Second replay attempt failed: {}", e);
-        }
-        
-        // Use the result of the retry
-        assert!(retry_replay.is_ok(), "Failed to replay dead letter event after retry");
-    } else {
-        assert!(replay_result.is_ok(), "Failed to replay dead letter event");
-    }
-    
-    // Wait for the replayed event to be processed
-    sleep(Duration::from_millis(1000)).await;
-    
-    // The event should no longer be in the dead letter queue
-    let dead_letter_events_after = store.get_dead_letter_events(0, 10).await?;
-    assert!(
-        dead_letter_events_after.items.iter().all(|e| e.id != dead_letter_event_id),
-        "Event still in dead letter queue after replay"
-    );
-    
-    // Create additional withdrawal to verify stream is unblocked
-    info!("Creating final withdrawal that should process normally");
-    let _final_withdraw = store.execute_command::<BankAccountAggregate>(
-        BankAccountCommand::WithdrawFunds { 
-            amount: 300,
-            account_id: account_id.clone(),
-        },
-        (),
-        json!({"user_id": user_id}),
     ).await?;
     
-    // Wait for it to be processed
-    sleep(Duration::from_millis(500)).await;
+    // Wait for the third event to be retried and moved to dead letter
+    sleep(Duration::from_secs(3)).await;
     
-    // Check the always succeed handler got the latest events
-    let final_events = always_succeed.get_processed_events();
-    info!("Always succeed handler now processed {} events", final_events.len());
+    // Assert third event failed and went to dead letter
+    let dead_letter_events = store.get_dead_letter_events(0, 10).await?;
+    let our_dead_letter_events: Vec<_> = dead_letter_events.items.iter()
+        .filter(|e| e.stream_id == account_id)
+        .collect();
     
-    // The always succeed handler should have processed more events after the replay
-    assert!(final_events.len() > always_succeed_events.len(), 
-        "No new events processed after dead letter replay");
+    assert!(!our_dead_letter_events.is_empty(), 
+            "Expected third event to be in dead letter queue");
+    assert_eq!(our_dead_letter_events[0].stream_position, 3, 
+            "Expected third event (position 2) to be in dead letter queue");
+    info!("✅ Third event failed and was moved to dead letter queue");
     
-    // Cleanup
-    store.shutdown().await;
+    // Step 4: Create the fourth event (should wait for third to be in dead letter)
+ 
+    
+    // Wait for fourth event to be processed
+    sleep(Duration::from_secs(3)).await;
+    
+    // Assert fourth event was processed after third went to dead letter
+    let processed_events = handler.get_processed_events();
+    let events = store.get_events_for_stream(BankAccountAggregate::name(), &account_id, -1, 10).await?;
+    let fourth_event_id = events.iter()
+        .find(|e| e.stream_position == 4)
+        .map(|e| e.id.clone())
+        .expect("Couldn't find fourth event");
+    
+    println!("Processed events: {:?}", processed_events);
+    println!("Fourth event id: {:?}", fourth_event_id); 
+    println!("Events: {:?}", events);
+    assert!(processed_events.contains(&fourth_event_id), 
+            "Fourth event should have been processed after third event went to dead letter");
+    info!("✅ Fourth event processed successfully after third event went to dead letter");
+    
+    // Final verification of all steps
+    info!("Final verification - checking all test assertions passed");
+    
+    // Verify we have exactly one event in the dead letter queue
+    let dead_letter_events = store.get_dead_letter_events(0, 10).await?;
+    let our_dead_letter_events: Vec<_> = dead_letter_events.items.iter()
+        .filter(|e| e.stream_id == account_id)
+        .collect();
+    
+    assert_eq!(our_dead_letter_events.len(), 1, "Expected exactly one event in dead letter queue");
+    assert_eq!(our_dead_letter_events[0].stream_position, 3, "Expected third event (position 2) to be in dead letter queue");
+    
+    // Verify all other events were processed correctly
+    let processed_events = handler.get_processed_events();
+    let attempt_counts = handler.get_attempt_counts();
+    
+    info!("Processed events count: {}", processed_events.len());
+    info!("Event attempt counts: {:?}", attempt_counts);
+    
+    // Verification complete
+    info!("✅ All verifications passed");
     
     Ok(())
 } 

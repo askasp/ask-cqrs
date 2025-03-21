@@ -1,4 +1,3 @@
-use core::fmt;
 use std::error::Error;
 use std::sync::Arc;
 
@@ -29,3 +28,9 @@ pub trait Aggregate {
         service: Self::Service,
     ) -> Result<Vec<Self::Event>, Self::DomainError>;
 }
+
+
+
+
+
+
