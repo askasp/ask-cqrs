@@ -634,6 +634,18 @@ impl PostgresEventStore {
     pub fn get_pool(&self) -> &PgPool {
         &self.pool
     }
+
+    /// Check if a handler already has any offset records
+    async fn handler_has_offsets(&self, handler_name: &str) -> Result<bool> {
+        let row = sqlx::query(
+            "SELECT EXISTS(SELECT 1 FROM handler_stream_offsets WHERE handler = $1) as has_offsets"
+        )
+        .bind(handler_name)
+        .fetch_one(&self.pool)
+        .await?;
+        
+        Ok(row.get::<bool, _>("has_offsets"))
+    }
 }
 
 #[async_trait]
@@ -704,21 +716,35 @@ impl EventStore for PostgresEventStore {
             
             info!("Starting event processor for handler: {}", handler_name);
             
-            // Set the initial processing strategy based on config
-            if config.start_from_beginning {
-                // This will make the handler process all events from the beginning
-                match store.initialize_handler_at_beginning::<H>().await {
-                    Ok(_) => info!("Handler  configured to start from beginning"),
-                    Err(e) => error!("Failed to initialize handler {} at beginning: {}", handler_name, e),
+            // Check if this handler already has any offsets
+            let handler_has_offsets = match store.handler_has_offsets(&handler_name).await {
+                Ok(has_offsets) => has_offsets,
+                Err(e) => {
+                    error!("Failed to check if handler {} has offsets: {}", handler_name, e);
+                    false
                 }
-            } else if config.start_from_current {
-                // This will make the handler start from the current position
-                match store.initialize_handler_at_current_position::<H>().await {
-                    Ok(count) => info!("Handler {} initialized at current position for {} new streams", handler_name, count),
-                    Err(e) => error!("Failed to initialize handler {} at current position: {}", handler_name, e),
+            };
+            
+            // Only initialize if the handler doesn't have offsets yet
+            if !handler_has_offsets {
+                // Set the initial processing strategy based on config
+                if config.start_from_beginning {
+                    // This will make the handler process all events from the beginning
+                    match store.initialize_handler_at_beginning::<H>().await {
+                        Ok(_) => info!("Handler configured to start from beginning"),
+                        Err(e) => error!("Failed to initialize handler {} at beginning: {}", handler_name, e),
+                    }
+                } else if config.start_from_current {
+                    // This will make the handler start from the current position
+                    match store.initialize_handler_at_current_position::<H>().await {
+                        Ok(count) => info!("Handler {} initialized at current position for {} new streams", handler_name, count),
+                        Err(e) => error!("Failed to initialize handler {} at current position: {}", handler_name, e),
+                    }
                 }
+                // Default behavior: process streams with no offsets from the beginning
+            } else {
+                info!("Handler {} already has offsets, skipping initialization", handler_name);
             }
-            // Default behavior: process streams with no offsets from the beginning
             
             loop {
                 // Break on shutdown signal
