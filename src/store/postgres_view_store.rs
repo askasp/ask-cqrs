@@ -601,6 +601,7 @@ impl ViewStore for PostgresViewStore {
         let stream_name = &event.stream_name;
         let stream_id = &event.stream_id;
         let position = event.stream_position;
+        let handler_name = V::name();
         
         let start = std::time::Instant::now();
         let timeout = std::time::Duration::from_millis(timeout_ms);
@@ -618,29 +619,42 @@ impl ViewStore for PostgresViewStore {
                 ));
             }
 
-            let state = self.get_view_state_position::<V>(
-                partition_key,
-                stream_name,
-                stream_id,
-            ).await?;
+            // Check handler_stream_offsets table for the current position
+            let row = sqlx::query(
+                "SELECT last_position 
+                 FROM handler_stream_offsets 
+                 WHERE handler = $1 
+                   AND stream_name = $2 
+                   AND stream_id = $3"
+            )
+            .bind(&handler_name)
+            .bind(stream_name)
+            .bind(stream_id)
+            .fetch_optional(&self.pool)
+            .await?;
             
-            debug!(
-                "Waiting for view {} to catch up: current_position={:?}, target_position={}",
-                partition_key, state, position
-            );
-            
-            match state {
-                Some(current_position) if current_position >= position => {
+            match row {
+                Some(row) => {
+                    let current_position: i64 = row.get("last_position");
                     debug!(
-                        "View {} caught up to position {} for stream {}/{}",
-                        partition_key, position, stream_name, stream_id
+                        "Waiting for view to catch up: current_position={}, target_position={}",
+                        current_position, position
                     );
-                    return Ok(());
-                }
-                _ => {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    
+                    if current_position >= position {
+                        debug!(
+                            "View {} caught up to position {} for stream {}/{}",
+                            partition_key, position, stream_name, stream_id
+                        );
+                        return Ok(());
+                    }
+                },
+                None => {
+                    debug!("No handler offset found yet, waiting...");
                 }
             }
+            
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         }
     }
 } 

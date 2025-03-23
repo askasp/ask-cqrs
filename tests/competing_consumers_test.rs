@@ -172,7 +172,6 @@ async fn test_competing_consumers() -> Result<()> {
         
         // Configure with shorter claim TTL for testing
         let config = EventProcessingConfig {
-            claim_ttl: Duration::from_secs(1),
             ..Default::default()
         };
         
@@ -251,9 +250,6 @@ async fn test_competing_consumers() -> Result<()> {
     }
     
     // Cleanup
-    for store in stores {
-        store.shutdown().await;
-    }
     
     Ok(())
 }

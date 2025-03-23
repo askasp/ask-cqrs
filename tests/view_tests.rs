@@ -27,7 +27,7 @@ async fn test_bank_account_view_async() -> Result<(), anyhow::Error> {
     let view_store = store.create_view_store();
     
     // Start view builder
-    store.start_view::<BankAccountView>(view_store.clone(), None).await?;
+    store.start_view::<BankAccountView>(view_store.clone(),None ).await?;
     
     // Generate a unique user ID for this test
     let user_id = Uuid::new_v4().to_string();

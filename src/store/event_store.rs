@@ -62,31 +62,34 @@ pub struct PaginatedResult<T> {
 }
 
 /// Configuration for event processing
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 pub struct EventProcessingConfig {
-    /// How long a claim lasts before expiring
-    pub claim_ttl: Duration,
-    /// Maximum number of retry attempts
-    pub max_retries: i32,
-    /// Base delay for exponential backoff
+    /// Base delay for retries
     pub base_retry_delay: Duration,
-    /// Max delay between retries
+    /// Maximum delay for retries
     pub max_retry_delay: Duration,
-    /// Batch size for processing events
+    /// Maximum number of retries before dead-lettering
+    pub max_retries: i32,
+    /// Number of events to process in a batch
     pub batch_size: i32,
-    /// Poll interval for checking new events
+    /// Interval for polling new events
     pub poll_interval: Duration,
+    /// Whether to start processing from the beginning of all streams
+    pub start_from_beginning: bool,
+    /// Whether to start processing from the current position of all streams
+    pub start_from_current: bool,
 }
 
 impl Default for EventProcessingConfig {
     fn default() -> Self {
         Self {
-            claim_ttl: Duration::from_secs(60),
-            max_retries: 10,
-            base_retry_delay: Duration::from_secs(5),
-            max_retry_delay: Duration::from_secs(3600),
+            base_retry_delay: Duration::from_secs(30),
+            max_retry_delay: Duration::from_secs(24 * 60 * 60), // 1 day
+            max_retries: 5,
             batch_size: 100,
             poll_interval: Duration::from_secs(5),
+            start_from_beginning: false,
+            start_from_current: false,
         }
     }
 }
@@ -97,8 +100,6 @@ pub trait EventStore: Send + Sync + Clone {
     /// Initialize the event store
     async fn initialize(&self) -> Result<()>;
     
-    /// Shutdown the event store and all background tasks
-    async fn shutdown(&self);
     
     /// Execute a command and store resulting events
     async fn execute_command<A: Aggregate>(
@@ -131,15 +132,6 @@ pub trait EventStore: Send + Sync + Clone {
         from_position: i64,
         limit: i32,
     ) -> Result<Vec<EventRow>>;
-    
-    /// Get all events starting from a global position
-    async fn get_all_events(
-        &self,
-        from_position: i64,
-        limit: i32,
-    ) -> Result<Vec<EventRow>>;
-    
-    /// Get events from the dead letter queue
-    async fn get_dead_letter_events(&self, page: i64, page_size: i32) -> Result<PaginatedResult<DeadLetterEvent>>;
+
     
 }

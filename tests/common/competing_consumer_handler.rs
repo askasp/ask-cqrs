@@ -2,16 +2,12 @@ use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 use tokio::time::sleep;
 use std::time::Duration;
-use uuid::Uuid;
-use tracing::{info, error, warn};
+use tracing::{info, error};
 use anyhow::Result;
-use serde::{Serialize, Deserialize};
-use serde_json::Value;
 
-use super::bank_account::{BankAccountEvent, BankAccountCommand, BankAccountAggregate};
+use super::bank_account::{BankAccountEvent};
 use ask_cqrs::{
     event_handler::{EventHandler, EventHandlerError, EventRow},
-    store::event_store::EventStore,
     store::postgres_event_store::PostgresEventStore
 };
 

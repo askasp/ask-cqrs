@@ -7,7 +7,7 @@ pub async fn create_test_store() -> Result<ask_cqrs::store::postgres_event_store
     let pool = PgPool::connect("postgres://postgres:postgres@localhost:5432/ask_cqrs_test2").await?;
     
     // Clear event processing claims
-    sqlx::query("DELETE FROM event_processing_claims")
+    sqlx::query("DELETE FROM handler_stream_offsets")
         .execute(&pool)
         .await?;
 
@@ -24,7 +24,7 @@ pub async fn create_test_store() -> Result<ask_cqrs::store::postgres_event_store
 
     // Truncate all tables including dead_letter_events
     sqlx::query(
-        "TRUNCATE TABLE events, view_snapshots, event_processing_claims, dead_letter_events RESTART IDENTITY CASCADE"
+        "TRUNCATE TABLE events, view_snapshots, handler_stream_offsets"
     )
     .execute(&pool)
     .await?;

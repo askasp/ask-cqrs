@@ -103,7 +103,6 @@ async fn test_fraud_detection_handler() -> Result<(), anyhow::Error> {
     ));
 
     // Cleanup
-    store.shutdown().await;
     sleep(Duration::from_millis(100)).await;
 
     Ok(())
@@ -161,7 +160,6 @@ async fn test_fraud_detection_handler_small_withdrawals() -> Result<(), anyhow::
     }
 
     // Cleanup
-    store.shutdown().await;
     sleep(Duration::from_millis(100)).await;
 
     Ok(())
