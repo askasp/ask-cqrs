@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use ask_cqrs::store::EventProcessingConfig;
 use tracing::instrument;
 use uuid::Uuid;
 use serde_json::json;
@@ -252,6 +253,76 @@ async fn test_view_query_pagination() -> Result<(), anyhow::Error> {
     assert_eq!(all_accounts.len(), 2);
     assert!(all_accounts.contains(&result1.stream_id));
     assert!(all_accounts.contains(&result2.stream_id));
+
+    Ok(())
+}
+
+#[tokio::test]
+#[instrument]
+#[serial]
+async fn test_view_start_from_beginning() -> Result<(), anyhow::Error> {
+    initialize_logger();
+    let store = Arc::new(create_test_store().await?);
+    
+    // Create view store
+    let view_store = store.create_view_store();
+    
+    // Generate unique user ID
+    let user_id = Uuid::new_v4().to_string();
+
+    // First create some events without the view running
+    let result1 = store.execute_command::<BankAccountAggregate>(
+        BankAccountCommand::OpenAccount { 
+            user_id: user_id.clone(),
+            account_id: None,
+        },
+        (),
+        json!({"user_id": user_id}),
+    ).await?;
+    let account_id = result1.stream_id.clone();
+    
+    // Add some deposits
+    store.execute_command::<BankAccountAggregate>(
+        BankAccountCommand::DepositFunds { 
+            amount: 500,
+            account_id: account_id.clone(),
+        },
+        (),
+        json!({"user_id": user_id}),
+    ).await?;
+    
+    store.execute_command::<BankAccountAggregate>(
+        BankAccountCommand::DepositFunds { 
+            amount: 300,
+            account_id: account_id.clone(),
+        },
+        (),
+        json!({"user_id": user_id}),
+    ).await?;
+    
+    // Now start the view with start_from_beginning: true
+    let config = EventProcessingConfig {
+        start_from_beginning: true,
+        ..Default::default()
+    };
+    
+    tracing::info!("Starting view with start_from_beginning=true");
+    store.start_view::<BankAccountView>(view_store.clone(), Some(config)).await?;
+    
+    // Get the last created event to wait for
+    let events = store.get_events_for_stream("bank_account", &account_id, -1, 10).await?;
+    let last_event = events.last().expect("At least one event should exist");
+    
+    // Wait for view to catch up
+    view_store.wait_for_view::<BankAccountView>(last_event, &account_id, VIEW_TIMEOUT_MS).await?;
+
+    // Get view state - should have processed all events from the beginning
+    let view = view_store.get_view_state::<BankAccountView>(&account_id).await?
+        .expect("Account should exist in view");
+    
+    tracing::info!("View state after processing: {:?}", view);
+    assert_eq!(view.balance, 800, "Balance should reflect all deposits (500+300)");
+    assert_eq!(view.user_id, user_id);
 
     Ok(())
 } 
