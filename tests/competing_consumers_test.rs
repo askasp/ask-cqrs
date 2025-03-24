@@ -9,9 +9,8 @@ use anyhow::Result;
 use serial_test::serial;
 
 mod common;
-mod test_utils;
 
-use test_utils::{initialize_logger, create_test_store};
+use ask_cqrs::test_utils::{initialize_logger, create_test_store};
 use common::bank_account::{BankAccountAggregate, BankAccountCommand, BankAccountEvent};
 use common::competing_consumer_handler::{CompetingConsumerHandler, ProcessedEvents};
 
@@ -156,7 +155,7 @@ async fn test_competing_consumers() -> Result<()> {
     let mut node_ids = Vec::with_capacity(num_nodes);
     
     for i in 0..num_nodes {
-        let store = create_test_store().await?;
+        let store = create_test_store("postgres://postgres:postgres@localhost:5432/ask_cqrs_test2").await?;
         let node_id = format!("node-{}", i);
         node_ids.push(node_id.clone());
         

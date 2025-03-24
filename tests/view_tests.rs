@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use ask_cqrs::store::EventProcessingConfig;
+use ask_cqrs::test_utils::create_test_store;
 use tracing::instrument;
 use uuid::Uuid;
 use serde_json::json;
@@ -7,14 +8,13 @@ use serial_test::serial;
 use chrono::Utc;
 
 mod common;
-mod test_utils;
 
 use ask_cqrs::store::{EventStore, ViewStore, postgres_event_store::PostgresEventStore, event_store::PaginationOptions};
 use ask_cqrs::event_handler::EventRow;
 use common::bank_account::{BankAccountAggregate, BankAccountCommand};
 use common::bank_account_view::BankAccountView;
 use common::bank_liquidity_view::BankLiquidityView;
-use test_utils::{initialize_logger, create_test_store};
+use ask_cqrs::test_utils::{initialize_logger};
 
 const VIEW_TIMEOUT_MS: u64 = 5000;
 #[tokio::test]
@@ -22,7 +22,7 @@ const VIEW_TIMEOUT_MS: u64 = 5000;
 #[serial]
 async fn test_bank_account_view_async() -> Result<(), anyhow::Error> {
     initialize_logger();
-    let store = Arc::new(create_test_store().await?);
+    let store = Arc::new(create_test_store("postgres://postgres:postgres@localhost:5432/ask_cqrs_test2").await?);
     
     // Create view store
     let view_store = store.create_view_store();
@@ -80,7 +80,7 @@ async fn test_bank_account_view_async() -> Result<(), anyhow::Error> {
 #[serial]
 async fn test_bank_liquidity_view() -> Result<(), anyhow::Error> {
     initialize_logger();
-    let store = Arc::new(create_test_store().await?);
+    let store = Arc::new(create_test_store("postgres://postgres:postgres@localhost:5432/ask_cqrs_test2").await?);
     
     // Create view store
     let view_store = store.create_view_store();
@@ -190,7 +190,7 @@ async fn test_bank_liquidity_view() -> Result<(), anyhow::Error> {
 #[serial]
 async fn test_view_query_pagination() -> Result<(), anyhow::Error> {
     initialize_logger();
-    let store = Arc::new(create_test_store().await?);
+    let store = Arc::new(create_test_store("postgres://postgres:postgres@localhost:5432/ask_cqrs_test2").await?);
     
     // Create view store
     let view_store = store.create_view_store();
@@ -262,7 +262,7 @@ async fn test_view_query_pagination() -> Result<(), anyhow::Error> {
 #[serial]
 async fn test_view_start_from_beginning() -> Result<(), anyhow::Error> {
     initialize_logger();
-    let store = Arc::new(create_test_store().await?);
+    let store = Arc::new(create_test_store("postgres://postgres:postgres@localhost:5432/ask_cqrs_test2").await?);
     
     // Create view store
     let view_store = store.create_view_store();

@@ -6,11 +6,10 @@ use uuid::Uuid;
 use serde_json::json;
 
 mod common;
-mod test_utils;
 
 use common::bank_account::{BankAccountAggregate, BankAccountCommand, BankAccountError, BankAccountEvent};
 use common::fraud_detection_handler::FraudDetectionHandler;
-use test_utils::{initialize_logger, create_test_store};
+use ask_cqrs::test_utils::{initialize_logger, create_test_store};
 use ask_cqrs::store::event_store::{EventStore, EventProcessingConfig};
 use ask_cqrs::event_handler::{EventHandler, EventRow};
 
@@ -19,7 +18,7 @@ use ask_cqrs::event_handler::{EventHandler, EventRow};
 #[serial_test::serial]
 async fn test_fraud_detection_handler() -> Result<(), anyhow::Error> {
     initialize_logger();
-    let store = create_test_store().await?;
+    let store = create_test_store("postgres://postgres:postgres@localhost:5432/ask_cqrs_test2").await?;
     
     // Start the fraud detection handler
     let handler = FraudDetectionHandler::new(store.clone());
@@ -113,7 +112,7 @@ async fn test_fraud_detection_handler() -> Result<(), anyhow::Error> {
 #[serial_test::serial]
 async fn test_fraud_detection_handler_small_withdrawals() -> Result<(), anyhow::Error> {
     initialize_logger();
-    let store = create_test_store().await?;
+    let store = create_test_store("postgres://postgres:postgres@localhost:5432/ask_cqrs_test2").await?;
     
     // Start the fraud detection handler
     let handler = FraudDetectionHandler::new(store.clone());
@@ -172,7 +171,7 @@ async fn test_fraud_detection_handler_small_withdrawals() -> Result<(), anyhow::
 #[serial_test::serial]
 async fn test_fraud_detection_start_from_current() -> Result<(), anyhow::Error> {
     initialize_logger();
-    let store = create_test_store().await?;
+    let store = create_test_store("postgres://postgres:postgres@localhost:5432/ask_cqrs_test2").await?;
     
     // Generate a unique user ID for this test
     let user_id = Uuid::new_v4().to_string();

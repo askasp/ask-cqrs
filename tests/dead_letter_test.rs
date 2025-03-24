@@ -19,9 +19,8 @@ use serial_test::serial;
 use sqlx::Row;
 
 mod common;
-mod test_utils;
 
-use test_utils::{initialize_logger, create_test_store};
+use ask_cqrs::test_utils::{initialize_logger, create_test_store};
 use common::bank_account::{BankAccountAggregate, BankAccountCommand, BankAccountEvent};
 use ask_cqrs::store::event_store::{EventStore, EventProcessingConfig};
 use ask_cqrs::store::postgres_event_store::PostgresEventStore;
@@ -150,7 +149,7 @@ async fn test_retry_handling_simple_sequence() -> Result<()> {
     initialize_logger();
     
     // Create store with test configuration
-    let store = create_test_store().await?;
+    let store = create_test_store("postgres://postgres:postgres@localhost:5432/ask_cqrs_test2").await?;
     
     // Set max retries to 1 for quicker testing
     let event_config = EventProcessingConfig {

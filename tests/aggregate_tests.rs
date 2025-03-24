@@ -3,10 +3,9 @@ use uuid::Uuid;
 use serde_json::json;
 
 mod common;
-mod test_utils;
 
 use common::bank_account::{BankAccountAggregate, BankAccountCommand, BankAccountError};
-use test_utils::{initialize_logger, create_test_store};
+use ask_cqrs::test_utils::{initialize_logger, create_test_store};
 use ask_cqrs::store::event_store::EventStore;
 
 #[tokio::test]
@@ -14,7 +13,7 @@ use ask_cqrs::store::event_store::EventStore;
 #[serial_test::serial]
 async fn test_bank_account_aggregate() -> Result<(), anyhow::Error> {
     initialize_logger();
-    let store = create_test_store().await?;
+    let store = create_test_store("postgres://postgres:postgres@localhost:5432/ask_cqrs_test2").await?;
     
     // Test opening an account
     let user_id = Uuid::new_v4().to_string();
@@ -74,7 +73,7 @@ async fn test_bank_account_aggregate() -> Result<(), anyhow::Error> {
 #[serial_test::serial]
 async fn test_bank_account_duplicate_open() -> Result<(), anyhow::Error> {
     initialize_logger();
-    let store = create_test_store().await?;
+    let store = create_test_store("postgres://postgres:postgres@localhost:5432/ask_cqrs_test2").await?;
     
     // First open command
     let account_id = Uuid::new_v4().to_string();
@@ -112,7 +111,7 @@ async fn test_bank_account_duplicate_open() -> Result<(), anyhow::Error> {
 #[serial_test::serial]
 async fn test_bank_account_nonexistent() -> Result<(), anyhow::Error> {
     initialize_logger();
-    let store = create_test_store().await?;
+    let store = create_test_store("postgres://postgres:postgres@localhost:5432/ask_cqrs_test2").await?;
     
     // Try to deposit to nonexistent account
     let account_id = Uuid::new_v4().to_string();
