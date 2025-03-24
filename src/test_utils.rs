@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use sqlx::postgres::{PgPool, PgConnectOptions};
-use sqlx::ConnectOptions;
+use sqlx::{ConnectOptions, Executor};
 use url::Url;
 use std::str::FromStr;
 use tracing_subscriber;
@@ -58,7 +58,7 @@ pub async fn truncate_tables(pool: &PgPool) -> Result<()> {
 const EMBEDDED_SCHEMA: &str = include_str!("../src/schema.sql");
 
 /// Creates a test database with the given name and initializes it with the embedded schema
-pub async fn create_test_database(admin_connection_string: &str, test_db_name: &str) -> Result<String> {
+pub async fn create_test_database(admin_connection_string: &str, test_db_name: &str) -> Result<PostgresEventStore> {
     // Connect to postgres to create the database
     let options = PgConnectOptions::from_str(admin_connection_string)?
         .disable_statement_logging();
@@ -92,12 +92,13 @@ pub async fn create_test_database(admin_connection_string: &str, test_db_name: &
     let db_pool = PgPool::connect(&components).await?;
     
     // Execute the embedded schema SQL to initialize the database
-    sqlx::query(EMBEDDED_SCHEMA)
-        .execute(&db_pool)
+    db_pool.execute(EMBEDDED_SCHEMA)
         .await
         .context("Failed to initialize database schema")?;
     
-    Ok(components)
+    let store = create_test_store(&components).await?;
+
+    Ok(store)
 }
 
 /// Creates a test database with a custom schema file instead of the embedded one
