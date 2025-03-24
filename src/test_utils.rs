@@ -101,7 +101,7 @@ pub async fn create_test_database(admin_connection_string: &str, test_db_name: &
 }
 
 /// Creates a test database with a custom schema file instead of the embedded one
-pub async fn create_test_database_with_schema(admin_connection_string: &str, test_db_name: &str, schema_path: &str) -> Result<String> {
+pub async fn create_test_database_with_schema(admin_connection_string: &str, test_db_name: &str, schema_path: &str) -> Result<PostgresEventStore> {
     // Connect to postgres to create the database
     let options = PgConnectOptions::from_str(admin_connection_string)?
         .disable_statement_logging();
@@ -143,8 +143,10 @@ pub async fn create_test_database_with_schema(admin_connection_string: &str, tes
         .execute(&db_pool)
         .await
         .context("Failed to initialize database schema")?;
+
+    let store = create_test_store(&components).await?;
     
-    Ok(components)
+    Ok(store)
 }
 
 /// Drops a test database
