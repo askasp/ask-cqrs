@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow};
 use sqlx::{postgres::{PgPool, PgListener}, postgres::PgRow, Row, Executor, PgExecutor, FromRow};
 use uuid::Uuid;
-use tracing::{info, warn, error, debug, instrument, Span, trace, info_span, Level, enabled};
+use tracing::{debug, error, info, info_span, instrument, trace, warn, Span};
 use tokio::sync::broadcast;
 use serde_json::{self, Value as JsonValue, json};
 use chrono::{DateTime, Utc};
@@ -71,10 +71,12 @@ impl PostgresEventStore {
             Duration::from_secs(backoff)
         };
         
-        Utc::now() + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::seconds(60))
+        // Utc::now() + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::seconds(60))
+        Utc::now() - chrono::Duration::hours(1)
     }
 
     /// Find streams that need processing for a handler, including their current positions
+    #[instrument(skip(self, limit))]
     async fn find_streams_to_process(
         &self,
         handler_name: &str,
@@ -83,9 +85,11 @@ impl PostgresEventStore {
         // Find streams with new events or ready for retry, and include current position
         let rows = sqlx::query(
             r#"
-            SELECT streams.stream_name, streams.stream_id, 
-                   COALESCE(o.last_position, -1) as last_position,
-                   o.next_retry_at IS NOT NULL as is_retry
+            SELECT 
+                streams.stream_name, 
+                streams.stream_id, 
+                COALESCE(o.last_position, -1) as last_processed_position,
+                o.next_retry_at IS NOT NULL as is_retry
             FROM (
                 SELECT DISTINCT e.stream_name, e.stream_id
                 FROM events e
@@ -93,7 +97,9 @@ impl PostgresEventStore {
                   ON o.handler = $1 AND o.stream_id = e.stream_id AND o.stream_name = e.stream_name
                 WHERE (o.last_position IS NULL OR e.stream_position > o.last_position)
                    AND (o.dead_lettered IS NULL OR o.dead_lettered = false)
+                
                 UNION
+                
                 SELECT h.stream_name, h.stream_id
                 FROM handler_stream_offsets h
                 WHERE h.handler = $1 
@@ -115,16 +121,23 @@ impl PostgresEventStore {
         for row in rows {
             let stream_name: String = row.get("stream_name");
             let stream_id: String = row.get("stream_id");
-            let last_position: i64 = row.get("last_position");
+            let last_position: i64 = row.get("last_processed_position");
             let is_retry: bool = row.get("is_retry");
+            
             streams.push((stream_name, stream_id, last_position, is_retry));
         }
         
         debug!("Found {} streams to process for handler {}", streams.len(), handler_name);
+        if !streams.is_empty() {
+            for (name, id, pos, retry) in &streams {
+                info!("Stream to process: {}/{} start_position={} is_retry={}", name, id, pos, retry);
+            }
+        }
         Ok(streams)
     }
     
     /// Process streams for a handler
+    #[instrument(skip(self, handler, config))]
     async fn process_streams<H>(
         &self,
         handler: &H,
@@ -147,25 +160,17 @@ impl PostgresEventStore {
                 let store_clone = self.clone();
                 let handler_clone = handler.clone();
                 let config_clone = config.clone();
+                println!("Processing stream: {:?}", stream_name);
                 
                 async move {
-                    let process_span = info_span!(
-                        "process_stream", 
-                        stream_name = %stream_name, 
-                        stream_id = %stream_id,
-                        handler = %H::name()
-                    );
-                    
-                    process_span.in_scope(|| async {
-                        store_clone.process_stream_with_known_position(
-                            &handler_clone,
-                            &stream_name,
-                            &stream_id,
-                            last_position,
-                            is_retry,
-                            &config_clone
-                        ).await
-                    }).await
+                    store_clone.process_stream_with_known_position(
+                        &handler_clone,
+                        &stream_name,
+                        &stream_id,
+                        last_position,
+                        is_retry,
+                        &config_clone
+                    ).await
                 }
             })
         ).await;
@@ -174,6 +179,11 @@ impl PostgresEventStore {
         let processed_count = results.into_iter()
             .filter(|r| r.is_ok())
             .count();
+        
+        // Raise to info level if processed streams > 0
+        if processed_count > 0 {
+            info!(handler = %H::name(), "Processed {} streams", processed_count);
+        }
         
         Ok(processed_count)
     }
@@ -197,12 +207,31 @@ impl PostgresEventStore {
     ) -> Result<bool> {
         let lock_key = self.advisory_lock_key(stream_name, stream_id, handler_name);
         
+        // Debug: Print when attempting to acquire lock
+        println!("LOCK: Attempting to acquire lock with key {} for {}/{}, handler={}", 
+                 lock_key, stream_name, stream_id, handler_name);
+                 
+        // Check if lock is already held by someone
+        let holders_row = sqlx::query("SELECT count(*) as lock_count FROM pg_locks WHERE locktype = 'advisory' AND objid = $1")
+            .bind(lock_key as i64)
+            .fetch_one(&self.pool)
+            .await?;
+            
+        let lock_count: i64 = holders_row.get("lock_count");
+        println!("LOCK: Found {} existing holders for lock key {}", lock_count, lock_key);
+        
+        // Use session-level lock instead of transaction-level lock
         let row = sqlx::query("SELECT pg_try_advisory_lock($1)")
             .bind(lock_key)
             .fetch_one(&self.pool)
             .await?;
             
-        Ok(row.get::<bool, _>(0))
+        let acquired = row.get::<bool, _>(0);
+        
+        // Debug: Print lock acquisition result
+        println!("LOCK: Lock acquisition result for key {}: {}", lock_key, acquired);
+        
+        Ok(acquired)
     }
     
     /// Release an advisory lock for a stream
@@ -214,15 +243,39 @@ impl PostgresEventStore {
     ) -> Result<()> {
         let lock_key = self.advisory_lock_key(stream_name, stream_id, handler_name);
         
-        sqlx::query("SELECT pg_advisory_unlock($1)")
+        // Debug: Print when attempting to release lock
+        println!("LOCK: Attempting to release lock with key {} for {}/{}, handler={}", 
+                 lock_key, stream_name, stream_id, handler_name);
+                 
+        // Query to release lock
+        let result = sqlx::query("SELECT pg_advisory_unlock($1)")
             .bind(lock_key)
             .execute(&self.pool)
             .await?;
             
+        // Debug: Print release result
+        println!("LOCK: Lock release for key {}: executed with {} rows affected", 
+                 lock_key, result.rows_affected());
+                 
+        // Verify the lock was released
+        let holders_row = sqlx::query("SELECT count(*) as lock_count FROM pg_locks WHERE locktype = 'advisory' AND objid = $1")
+            .bind(lock_key as i64)
+            .fetch_one(&self.pool)
+            .await?;
+            
+        let lock_count: i64 = holders_row.get("lock_count");
+        println!("LOCK: After release, found {} existing holders for lock key {}", lock_count, lock_key);
+        
         Ok(())
     }
     
     /// Process a single stream for a handler with advisory locking
+    #[instrument(skip(self, handler, config), fields(
+        stream_name = %stream_name, 
+        stream_id = %stream_id, 
+        last_position = last_position,
+        is_retry = is_retry
+    ))]
     async fn process_stream_with_known_position<H>(
         &self,
         handler: &H,
@@ -237,17 +290,32 @@ impl PostgresEventStore {
     {
         let handler_name = H::name();
         
-        // Try to acquire advisory lock
-        if !self.try_acquire_lock(stream_name, stream_id, handler_name).await? {
-            debug!("Could not acquire lock for {}/{}, handler={}", 
-                   stream_name, stream_id, handler_name);
+        if is_retry {
+            debug!("Processing stream as a retry");
+        }
+        
+        // Acquire a dedicated connection from the pool
+        let mut conn = self.pool.acquire().await?;
+        
+        // Generate lock key
+        let lock_key = self.advisory_lock_key(stream_name, stream_id, handler_name);
+        println!("DIAGNOSTIC: Acquiring lock {} on dedicated connection", lock_key);
+        
+        // Try to acquire the lock on this specific connection
+        let row = sqlx::query("SELECT pg_try_advisory_lock($1)")
+            .bind(lock_key)
+            .fetch_one(&mut *conn)
+            .await?;
+        
+        let acquired = row.get::<bool, _>(0);
+        if !acquired {
+            println!("DIAGNOSTIC: Could not acquire lock {} on dedicated connection", lock_key);
             return Ok(());
         }
         
-        debug!("Acquired lock for {}/{}, handler={}", 
-               stream_name, stream_id, handler_name);
+        println!("DIAGNOSTIC: Successfully acquired lock {} on dedicated connection", lock_key);
         
-        // Make sure we release the lock when we're done
+        // Process the stream
         let result = self.process_stream_with_lock(
             handler, 
             stream_name, 
@@ -257,13 +325,16 @@ impl PostgresEventStore {
             config
         ).await;
         
-        // Always release the lock
-        if let Err(e) = self.release_lock(stream_name, stream_id, handler_name).await {
-            error!("Failed to release lock for {}/{}, handler={}: {}", 
-                   stream_name, stream_id, handler_name, e);
-        } else {
-            debug!("Released lock for {}/{}, handler={}", 
-                   stream_name, stream_id, handler_name);
+        // Release the lock on the same connection
+        println!("DIAGNOSTIC: Releasing lock {} on dedicated connection", lock_key);
+        let release_result = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(lock_key)
+            .execute(&mut *conn)
+            .await;
+        
+        match release_result {
+            Ok(_) => println!("DIAGNOSTIC: Successfully released lock {} on dedicated connection", lock_key),
+            Err(e) => println!("DIAGNOSTIC: Failed to release lock {}: {}", lock_key, e),
         }
         
         // Return the original result
@@ -271,6 +342,12 @@ impl PostgresEventStore {
     }
     
     /// Process a stream once we have the lock and know the current position
+    #[instrument(skip(self, handler, config), fields(
+        stream_name = %stream_name, 
+        stream_id = %stream_id, 
+        last_position = last_position,
+        is_retry = is_retry
+    ))]
     async fn process_stream_with_lock<H>(
         &self,
         handler: &H,
@@ -285,10 +362,15 @@ impl PostgresEventStore {
     {
         let handler_name = H::name();
         
-        // Ensure offset record exists (this is the fix for missing offset records)
+        // Log retry status
+        if is_retry {
+            info!("Processing stream as a retry");
+        }
+        
+        // Ensure offset record exists
         self.ensure_handler_offset_exists(handler_name, stream_name, stream_id, last_position).await?;
         
-        // Get events to process
+        // Get events to process - for retries, we need to get the specific event that failed
         let events = self.get_events_for_stream(
             stream_name,
             stream_id,
@@ -297,14 +379,11 @@ impl PostgresEventStore {
         ).await?;
         
         if events.is_empty() {
-            debug!("No events to process for {}/{}, handler={}", 
-                  stream_name, stream_id, handler_name);
-            
-            // If this was a retry but there are no events, clear retry status
+            debug!("No events to process");
             if is_retry {
                 self.clear_retry_status(stream_name, stream_id, handler_name).await?;
             }
-            
+
             return Ok(());
         }
         
@@ -313,36 +392,28 @@ impl PostgresEventStore {
         
         for event in events {
             let position = event.stream_position;
-            let event_span = info_span!("process_event", 
-                handler = %handler_name,
-                stream_name = %stream_name, 
-                stream_id = %stream_id,
-                position = position
-            );
             
-            let result = event_span.in_scope(|| async {
-                // Process the event
-                match serde_json::from_value::<H::Events>(event.event_data.clone()) {
-                    Ok(typed_event) => {
-                        handler.handle_event(typed_event, event.clone()).await
-                            .map_err(|e| anyhow!("Handler error: {}", e.log_message))
-                    },
-                    Err(e) => {
-                        Err(anyhow!("Deserialization error: {}", e))
-                    }
+            // Process the event
+            let result = match serde_json::from_value::<H::Events>(event.event_data.clone()) {
+                Ok(typed_event) => {
+                    handler.handle_event(typed_event, event.clone()).await
+                        .map_err(|e| anyhow!("Handler error: {}", e.log_message))
+                },
+                Err(e) => {
+                    Err(anyhow!("Deserialization error: {}", e))
                 }
-            }).await;
+            };
             
             match result {
                 Ok(_) => {
                     // Update max position
                     max_position = position;
-                    trace!("Successfully processed event at position {}", position);
+                    debug!(position, "Successfully processed event");
                 },
                 Err(e) => {
                     // Record error and schedule retry
                     let error_msg = e.to_string();
-                    error!("Error processing event at position {}: {}", position, error_msg);
+                    error!(position, error = %error_msg, "Error processing event");
                     
                     self.record_processing_error(
                         stream_name,
@@ -370,8 +441,12 @@ impl PostgresEventStore {
                 is_retry
             ).await?;
             
-            debug!("Updated position to {} for {}/{}, handler={}", 
-                   max_position, stream_name, stream_id, handler_name);
+            info!(
+                handler = %handler_name,
+                prev_position = last_position,
+                new_position = max_position, 
+                "Stream processing completed"
+            );
         }
         
         Ok(())
@@ -650,8 +725,9 @@ impl PostgresEventStore {
 
 #[async_trait]
 impl EventStore for PostgresEventStore {
-      /// Get events for a specific stream after a position
-      async fn get_events_for_stream(
+    /// Get events for a specific stream after a position
+    #[instrument(skip(self))]
+    async fn get_events_for_stream(
         &self, 
         stream_name: &str, 
         stream_id: &str, 
@@ -684,15 +760,16 @@ impl EventStore for PostgresEventStore {
                 event_data: row.get("event_data"),
                 metadata: row.get("metadata"),
                 stream_position: row.get("stream_position"),
-                global_position: 0, // This field will be removed in a future update
                 created_at: row.get("created_at"),
             });
         }
 
+        debug!(count = events.len(), "Retrieved events for stream");
         Ok(events)
     }
     
     /// Start an event handler
+    #[instrument(skip(self, handler, config))]
     async fn start_event_handler<H: EventHandler + Send + Sync + Clone + 'static>(
         &self,
         handler: H,
@@ -852,7 +929,6 @@ impl EventStore for PostgresEventStore {
                 event_data: event_json.clone(),
                 metadata: metadata.clone(),
                 stream_position,
-                global_position: 0, // This field will be removed in a future update
                 created_at: row.get("created_at"),
             };
             
@@ -869,7 +945,7 @@ impl EventStore for PostgresEventStore {
 
         Ok(CommandResult {
             stream_id,
-            global_position: 0, // This field will be removed in a future update
+            global_position: 0, // This field is deprecated and will be removed
             stream_position: final_stream_position,
             events: created_events,
         })

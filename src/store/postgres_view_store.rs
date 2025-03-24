@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow};
 use sqlx::{postgres::PgPool, Row};
-use tracing::{info, error, debug, instrument, Span, trace, info_span};
+use tracing::{info, error, debug, instrument, warn};
 use serde_json::{self, Value as JsonValue, json};
 use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
@@ -103,6 +103,7 @@ impl PostgresViewStore {
 
 #[async_trait]
 impl ViewStore for PostgresViewStore {
+    #[instrument(skip(self))]
     async fn initialize(&self) -> Result<()> {
         // Check if the view_snapshots table exists
         let view_snapshots_exist = self.table_exists("view_snapshots").await?;
@@ -111,15 +112,14 @@ impl ViewStore for PostgresViewStore {
             return Err(anyhow!("The view_snapshots table doesn't exist. Please run initialization for the event store first."));
         }
         
+        info!("View store initialized successfully");
         Ok(())
     }
     
+    #[instrument(skip(self))]
     async fn get_view_state<V: View>(&self, partition_key: &str) -> Result<Option<V>> {
-        let view_span = info_span!("get_view_state", view_name = %V::name(), partition_key = %partition_key);
-        let _guard = view_span.enter();
-        
         let row = sqlx::query(
-            "SELECT state, last_processed_global_position, processed_stream_positions
+            "SELECT state, processed_stream_positions
              FROM view_snapshots 
              WHERE view_name = $1 AND partition_key = $2"
         )
@@ -130,8 +130,7 @@ impl ViewStore for PostgresViewStore {
 
         match row {
             Some(row) => {
-                let position: i64 = row.get("last_processed_global_position");
-                debug!(global_position = position, "Retrieved view state");
+                debug!("Retrieved view state");
                 Ok(Some(serde_json::from_value(row.get("state"))?))
             },
             None => {
@@ -141,24 +140,16 @@ impl ViewStore for PostgresViewStore {
         }
     }
     
+    #[instrument(skip(self, event_row), fields(
+        stream_name = %event_row.stream_name,
+        stream_id = %event_row.stream_id,
+        stream_position = event_row.stream_position
+    ))]
     async fn is_event_processed<V: View>(
         &self,
         partition_key: &str,
         event_row: &EventRow,
     ) -> Result<bool> {
-        let span = info_span!(
-            "is_event_processed", 
-            view_name = %V::name(),
-            partition_key = %partition_key,
-            stream_name = %event_row.stream_name,
-            stream_id = %event_row.stream_id,
-            stream_position = event_row.stream_position,
-            global_position = event_row.global_position
-        );
-        let _guard = span.enter();
-        
-        trace!("Checking if event is already processed");
-        
         // Check if we have already processed this event for this stream
         let row = sqlx::query(
             "SELECT processed_stream_positions
@@ -191,32 +182,19 @@ impl ViewStore for PostgresViewStore {
         Ok(false)
     }
     
+    #[instrument(skip(self, view), fields(
+        stream_name = %event_row.stream_name,
+        stream_id = %event_row.stream_id,
+        stream_position = event_row.stream_position
+    ))]
     async fn save_view_state<V: View>(
         &self,
         partition_key: &str,
         view: &V,
         event_row: &EventRow,
     ) -> Result<()> {
-        let span = info_span!(
-            "save_view_state",
-            view_name = %V::name(),
-            partition_key = %partition_key,
-            stream_name = %event_row.stream_name,
-            stream_id = %event_row.stream_id,
-            stream_position = event_row.stream_position,
-            global_position = event_row.global_position
-        );
-        let _guard = span.enter();
-        
         let state_json = serde_json::to_value(view)?;
         let id = Uuid::new_v4().to_string();
-        let stream_key = Self::get_stream_key(&event_row.stream_name, &event_row.stream_id);
-        
-        trace!(
-            id = %id,
-            stream_key = %stream_key,
-            "Saving view state"
-        );
         
         // Check if there's an existing record to get current positions
         let existing_row = sqlx::query(
@@ -232,13 +210,7 @@ impl ViewStore for PostgresViewStore {
         // Initialize our positions, either from existing data or as new
         let mut positions = if let Some(row) = existing_row {
             let positions_json: JsonValue = row.get("processed_stream_positions");
-            let positions = StreamPositions::from_json(positions_json)?;
-            debug!(
-                stream_name = %event_row.stream_name,
-                stream_id = %event_row.stream_id,
-                "Loaded existing positions: {:?}", positions
-            );
-            positions
+            StreamPositions::from_json(positions_json)?
         } else {
             debug!("No existing positions found, creating new");
             StreamPositions::new()
@@ -248,56 +220,39 @@ impl ViewStore for PostgresViewStore {
         let prev_position = positions.get_position(&event_row.stream_name, &event_row.stream_id);
         positions.set_position(&event_row.stream_name, &event_row.stream_id, event_row.stream_position);
         
-        debug!(
-            prev_position = ?prev_position,
-            new_position = event_row.stream_position,
-            stream_name = %event_row.stream_name,
-            stream_id = %event_row.stream_id,
-            "Updated stream position"
-        );
-        
         // Serialize positions
         let positions_json = serde_json::to_value(&positions)?;
         
         // Now do the upsert with our prepared positions
-        sqlx::query(
-            r#"
+        let query = r#"
             INSERT INTO view_snapshots 
-            (id, view_name, partition_key, state, last_processed_global_position, processed_stream_positions)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            (id, view_name, partition_key, state, processed_stream_positions)
+            VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (view_name, partition_key) 
             DO UPDATE SET 
                 state = $4, 
-                last_processed_global_position = $5,
-                processed_stream_positions = $6
-            "#
-        )
-        .bind(&id)
-        .bind(V::name())
-        .bind(partition_key)
-        .bind(&state_json)
-        .bind(event_row.global_position)
-        .bind(&positions_json)
-        .execute(&self.pool)
-        .await?;
+                processed_stream_positions = $5
+            "#;
 
-        debug!("View state saved successfully");
+        sqlx::query(query)
+            .bind(&id)
+            .bind(V::name())
+            .bind(partition_key)
+            .bind(&state_json)
+            .bind(&positions_json)
+            .execute(&self.pool)
+            .await?;
+
         Ok(())
     }
     
+    #[instrument(skip(self, params, pagination))]
     async fn query_views<V: View>(
         &self,
         condition: &str,
         params: Vec<JsonValue>,
         pagination: Option<PaginationOptions>,
     ) -> Result<PaginatedResult<V>> {
-        let span = info_span!(
-            "query_views",
-            view_name = %V::name(),
-            condition = %condition
-        );
-        let _guard = span.enter();
-        
         // First get total count
         let view_name = V::name();
         let count_query = format!(
@@ -316,8 +271,6 @@ impl ViewStore for PostgresViewStore {
         let count_row = count_builder.fetch_one(&self.pool).await?;
         let total_count: i64 = count_row.get("count");
 
-        trace!(total_count, "Query count result");
-
         if total_count == 0 {
             debug!("No views found matching condition");
             return Ok(PaginatedResult {
@@ -330,10 +283,6 @@ impl ViewStore for PostgresViewStore {
 
         // Add pagination if provided
         let (query, page, page_size) = if let Some(ref pagination) = pagination {
-            Span::current()
-                .record("page", pagination.page)
-                .record("page_size", pagination.page_size);
-                
             (
                 format!(
                     "SELECT partition_key, state 
@@ -385,13 +334,6 @@ impl ViewStore for PostgresViewStore {
             items.push(view);
         }
 
-        debug!(
-            found_items = result_count, 
-            total_count, 
-            page, 
-            "Query executed successfully"
-        );
-
         Ok(PaginatedResult {
             items,
             total_count,
@@ -400,10 +342,8 @@ impl ViewStore for PostgresViewStore {
         })
     }
     
+    #[instrument(skip(self), level = "debug")]
     async fn get_view_by_user_id<V: View>(&self, user_id: &str) -> Result<Option<V>> {
-        let query_span = info_span!("query_views_by_user_id", user_id = %user_id, view_name = %V::name());
-        let _guard = query_span.enter();
-        
         let res = self.query_views::<V>(
             "state->>'user_id' = ($2#>>'{}')::text",
             vec![json!(user_id)],
@@ -419,10 +359,8 @@ impl ViewStore for PostgresViewStore {
         }
     }
     
+    #[instrument(skip(self), level = "debug")]
     async fn get_views_by_user_id<V: View>(&self, user_id: &str) -> Result<Vec<V>> {
-        let query_span = info_span!("query_views_by_user_id", user_id = %user_id, view_name = %V::name());
-        let _guard = query_span.enter();
-        
         let res = self.query_views::<V>(
             "state->>'user_id' = ($2#>>'{}')::text",
             vec![json!(user_id)],
@@ -433,10 +371,8 @@ impl ViewStore for PostgresViewStore {
         Ok(res.items)
     }
     
+    #[instrument(skip(self), level = "debug")]
     async fn get_all_views<V: View>(&self) -> Result<Vec<V>> {
-        let query_span = info_span!("query_all_views", view_name = %V::name());
-        let _guard = query_span.enter();
-        
         let res = self.query_views::<V>("true", vec![], None).await?;
         
         debug!(count = res.items.len(), "Retrieved all views");
@@ -444,21 +380,13 @@ impl ViewStore for PostgresViewStore {
     }
     
     /// Get the state of a view for a specific stream
+    #[instrument(skip(self), level = "debug")]
     async fn get_view_state_by_stream<V: View + Default>(
         &self,
         stream_name: &str,
         stream_id: &str, 
         partition_key: &str
     ) -> Result<Option<V>> {
-        let view_span = info_span!(
-            "get_view_state_by_stream", 
-            view_name = %V::name(), 
-            stream_name = %stream_name,
-            stream_id = %stream_id,
-            partition_key = %partition_key
-        );
-        let _guard = view_span.enter();
-        
         // First get the view state
         let view = self.get_view_state::<V>(partition_key).await?;
         
@@ -473,7 +401,8 @@ impl ViewStore for PostgresViewStore {
     }
     
     /// Save a view state with a stream position
-    async fn save_view_state_with_position<V: View + Default>(
+    #[instrument(skip(self, state))]
+    async fn save_view_state_with_position<V: View + Default >(
         &self,
         stream_name: &str,
         stream_id: &str,
@@ -481,16 +410,6 @@ impl ViewStore for PostgresViewStore {
         state: &V,
         position: i64,
     ) -> Result<()> {
-        let span = info_span!(
-            "save_view_state_with_position",
-            view_name = %V::name(),
-            partition_key = %partition_key,
-            stream_name = %stream_name,
-            stream_id = %stream_id,
-            position = position
-        );
-        let _guard = span.enter();
-        
         let state_json = serde_json::to_value(state)?;
         let id = Uuid::new_v4().to_string();
         
@@ -527,45 +446,37 @@ impl ViewStore for PostgresViewStore {
         let positions_json = serde_json::to_value(&positions)?;
         
         // Do the upsert with our prepared positions
-        sqlx::query(
-            r#"
+        let query = r#"
             INSERT INTO view_snapshots 
-            (id, view_name, partition_key, state, last_processed_global_position, processed_stream_positions)
-            VALUES ($1, $2, $3, $4, 0, $5)
+            (id, view_name, partition_key, state, processed_stream_positions)
+            VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (view_name, partition_key) 
             DO UPDATE SET 
                 state = $4, 
                 processed_stream_positions = $5
-            "#
-        )
-        .bind(&id)
-        .bind(V::name())
-        .bind(partition_key)
-        .bind(&state_json)
-        .bind(&positions_json)
-        .execute(&self.pool)
-        .await?;
+            "#;
+
+        sqlx::query(query)
+            .bind(&id)
+            .bind(V::name())
+            .bind(partition_key)
+            .bind(&state_json)
+            .bind(&positions_json)
+            .execute(&self.pool)
+            .await?;
 
         debug!("View state saved successfully with position");
         Ok(())
     }
     
     /// Get the position of a view
+    #[instrument(skip(self))]
     async fn get_view_state_position<V: View + Default>(
         &self,
         partition_key: &str,
         stream_name: &str,
         stream_id: &str,
     ) -> Result<Option<i64>> {
-        let span = info_span!(
-            "get_view_state_position",
-            view_name = %V::name(),
-            partition_key = %partition_key,
-            stream_name = %stream_name,
-            stream_id = %stream_id
-        );
-        let _guard = span.enter();
-        
         // Get the processed_stream_positions for this view
         let row = sqlx::query(
             "SELECT processed_stream_positions
@@ -592,6 +503,7 @@ impl ViewStore for PostgresViewStore {
     }
     
     /// Wait for a view to catch up to a specific event
+    #[instrument(skip(self))]
     async fn wait_for_view<V: View + Default>(
         &self,
         event: &EventRow,

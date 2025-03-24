@@ -63,7 +63,6 @@ CREATE TABLE IF NOT EXISTS view_snapshots (
     view_name TEXT NOT NULL,
     partition_key TEXT NOT NULL,
     state JSONB NOT NULL,
-    last_processed_global_position BIGINT NOT NULL,
     -- Map of "stream_name:stream_id" to stream position
     processed_stream_positions JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,

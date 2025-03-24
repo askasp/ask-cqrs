@@ -62,11 +62,13 @@ impl EventHandler for SequencedFailureHandler {
     }
 
     async fn handle_event(&self, event: Self::Events, event_row: EventRow) -> Result<(), EventHandlerError> {
+        error!("Handling event: {:?}", event);
+        println!("Handling event: {:?}", event);
         // Track attempt count for this event
         let mut attempts = self.event_attempts.lock().unwrap();
         let attempt_count = *attempts.entry(event_row.id.clone()).or_insert(0);
         attempts.insert(event_row.id.clone(), attempt_count + 1);
-        
+      
         // Get the event position in the stream to determine behavior
         let position = event_row.stream_position;
         
@@ -156,6 +158,7 @@ async fn test_retry_handling_simple_sequence() -> Result<()> {
         base_retry_delay: Duration::from_millis(200),
         max_retry_delay: Duration::from_millis(500),
         poll_interval: Duration::from_millis(500),
+        start_from_beginning: true,
         ..Default::default()
     };
     
@@ -179,7 +182,7 @@ async fn test_retry_handling_simple_sequence() -> Result<()> {
     ).await?;
     
     // Give the handler a moment to process the first event
-    sleep(Duration::from_millis(2000)).await;
+    sleep(Duration::from_millis(500)).await;
     
     // Assert first event was processed successfully
     let processed_events = handler.get_processed_events();
@@ -205,7 +208,7 @@ async fn test_retry_handling_simple_sequence() -> Result<()> {
     ).await?;
     
     // Wait for retry and processing of the second event
-    sleep(Duration::from_secs(3)).await;
+    sleep(Duration::from_secs(1)).await;
     
     // Assert second event failed first, then succeeded on retry
     let processed_events = handler.get_processed_events();
@@ -248,7 +251,7 @@ async fn test_retry_handling_simple_sequence() -> Result<()> {
     ).await?;
     
     // Wait for the third event to be retried and marked as dead-lettered
-    sleep(Duration::from_secs(5)).await;
+    sleep(Duration::from_secs(1)).await;
     
     // Assert third event failed and is marked as dead-lettered
     let dead_lettered = check_dead_lettered_events(&store, &account_id, SequencedFailureHandler::name()).await?;

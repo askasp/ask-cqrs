@@ -12,7 +12,6 @@ pub struct EventRow {
     pub event_data: Value,
     pub metadata: Value,
     pub stream_position: i64,
-    pub global_position: i64,
     pub created_at: DateTime<Utc>,
 }
 
