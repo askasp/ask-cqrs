@@ -119,7 +119,7 @@ impl ViewStore for PostgresViewStore {
     #[instrument(skip(self))]
     async fn get_view_state<V: View>(&self, partition_key: &str) -> Result<Option<V>> {
         let row = sqlx::query(
-            "SELECT state, processed_stream_positions
+            "SELECT state
              FROM view_snapshots 
              WHERE view_name = $1 AND partition_key = $2"
         )
