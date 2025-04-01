@@ -864,6 +864,7 @@ impl EventStore for PostgresEventStore {
             
             // Use a semaphore to limit concurrent stream processing
             let semaphore = Arc::new(tokio::sync::Semaphore::new(20));
+            let handler_name_clone = handler_name.clone();
             
             loop {
                 // Process a limited number of streams
@@ -872,23 +873,24 @@ impl EventStore for PostgresEventStore {
                     Err(_) => break, // Semaphore closed, exit loop
                 };
                 
-                let process_span = info_span!("process_streams", handler = %handler_name);
+                let process_span = info_span!("process_streams", handler = %handler_name_clone);
                 let _process_guard = process_span.enter();
                 
                 let store_clone = store.clone();
                 let handler_clone = handler.clone();
                 let config_clone = config.clone();
+                let handler_name_for_task = handler_name_clone.clone(); // Create a new clone specifically for the task
                 
                 // Process streams in a separate task to avoid blocking
                 tokio::spawn(async move {
                     match store_clone.process_streams(&handler_clone, &config_clone, 10).await {
                         Ok(processed) => {
                             if processed > 0 {
-                                debug!("Processed {} streams for handler: {}", processed, handler_name);
+                                debug!("Processed {} streams for handler: {}", processed, handler_name_for_task);
                             }
                         },
                         Err(e) => {
-                            error!("Error processing streams for handler {}: {}", handler_name, e);
+                            error!("Error processing streams for handler {}: {}", handler_name_for_task, e);
                         }
                     }
                     // Permit is dropped automatically when this task completes
@@ -899,7 +901,7 @@ impl EventStore for PostgresEventStore {
                 tokio::select! {
                     notification = listener.recv() => {
                         match notification {
-                            Ok(_) => debug!("Received notification of new event for handler: {}", handler_name),
+                            Ok(_) => debug!("Received notification of new event for handler: {}", handler_name_clone),
                             Err(e) => error!("Error receiving notification: {}", e),
                         }
                     }
