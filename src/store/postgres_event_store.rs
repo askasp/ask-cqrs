@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow};
-use sqlx::{postgres::{PgPool, PgListener}, postgres::PgRow, Row, Executor, PgExecutor, FromRow};
+use sqlx::{postgres::{PgPool, PgListener, PgPoolOptions}, postgres::PgRow, Row, Executor, PgExecutor, FromRow};
 use uuid::Uuid;
 use tracing::{debug, error, info, info_span, instrument, trace, warn, Span};
 use tokio::sync::broadcast;
@@ -33,7 +33,9 @@ pub struct PostgresEventStore {
 impl PostgresEventStore {
     /// Create a new PostgreSQL event store with the given connection string
     pub async fn new(connection_string: &str) -> Result<Self> {
-        let pool = PgPool::connect(connection_string)
+        let pool = PgPoolOptions::new()
+            .max_connections(30)  // Increase this for more concurrency
+            .connect(connection_string)
             .await
             .map_err(|e| anyhow!("Failed to create pool: {}", e))?;
 

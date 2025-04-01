@@ -150,35 +150,28 @@ impl ViewStore for PostgresViewStore {
         partition_key: &str,
         event_row: &EventRow,
     ) -> Result<bool> {
-        // Check if we have already processed this event for this stream
+        // Instead of checking view_snapshots.processed_stream_positions
+        // Check the handler_stream_offsets directly
         let row = sqlx::query(
-            "SELECT processed_stream_positions
-             FROM view_snapshots 
-             WHERE view_name = $1 
-             AND partition_key = $2"
+            "SELECT last_position
+             FROM handler_stream_offsets 
+             WHERE handler = $1 
+             AND stream_name = $2
+             AND stream_id = $3"
         )
         .bind(V::name())
-        .bind(partition_key)
+        .bind(&event_row.stream_name)
+        .bind(&event_row.stream_id)
         .fetch_optional(&self.pool)
         .await?;
 
         if let Some(row) = row {
-            let positions_json: JsonValue = row.get("processed_stream_positions");
-            let positions = StreamPositions::from_json(positions_json)?;
-            
-            if let Some(last_position) = positions.get_position(&event_row.stream_name, &event_row.stream_id) {
-                // If the event's position is less than or equal to what we've already processed, skip it
-                if event_row.stream_position <= last_position {
-                    debug!(
-                        last_processed_position = last_position,
-                        "Event already processed"
-                    );
-                    return Ok(true);
-                }
+            let last_position: i64 = row.get("last_position");
+            if event_row.stream_position <= last_position {
+                return Ok(true);
             }
         }
         
-        debug!("Event not yet processed");
         Ok(false)
     }
     
@@ -196,50 +189,19 @@ impl ViewStore for PostgresViewStore {
         let state_json = serde_json::to_value(view)?;
         let id = Uuid::new_v4().to_string();
         
-        // Check if there's an existing record to get current positions
-        let existing_row = sqlx::query(
-            "SELECT processed_stream_positions 
-             FROM view_snapshots 
-             WHERE view_name = $1 AND partition_key = $2"
-        )
-        .bind(V::name())
-        .bind(partition_key)
-        .fetch_optional(&self.pool)
-        .await?;
-        
-        // Initialize our positions, either from existing data or as new
-        let mut positions = if let Some(row) = existing_row {
-            let positions_json: JsonValue = row.get("processed_stream_positions");
-            StreamPositions::from_json(positions_json)?
-        } else {
-            debug!("No existing positions found, creating new");
-            StreamPositions::new()
-        };
-        
-        // Update with the new position
-        let prev_position = positions.get_position(&event_row.stream_name, &event_row.stream_id);
-        positions.set_position(&event_row.stream_name, &event_row.stream_id, event_row.stream_position);
-        
-        // Serialize positions
-        let positions_json = serde_json::to_value(&positions)?;
-        
-        // Now do the upsert with our prepared positions
+        // Just save the view state without tracking positions
         let query = r#"
             INSERT INTO view_snapshots 
-            (id, view_name, partition_key, state, processed_stream_positions)
-            VALUES ($1, $2, $3, $4, $5)
+            (id, view_name, partition_key, state)
+            VALUES ($1, $2, $3, $4)
             ON CONFLICT (view_name, partition_key) 
-            DO UPDATE SET 
-                state = $4, 
-                processed_stream_positions = $5
-            "#;
+            DO UPDATE SET state = $4"#;
 
         sqlx::query(query)
             .bind(&id)
             .bind(V::name())
             .bind(partition_key)
             .bind(&state_json)
-            .bind(&positions_json)
             .execute(&self.pool)
             .await?;
 
