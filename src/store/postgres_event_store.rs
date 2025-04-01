@@ -35,7 +35,7 @@ impl PostgresEventStore {
     /// Create a new PostgreSQL event store with the given connection string
     pub async fn new(connection_string: &str) -> Result<Self> {
         let pool = PgPoolOptions::new()
-            .max_connections(100)  // Increased from 30
+            .max_connections(30)  // Increased from 30
             .acquire_timeout(Duration::from_secs(15))  // Add timeout
             .idle_timeout(Duration::from_secs(60))  // Clean up idle connections
             .connect(connection_string)
@@ -805,7 +805,6 @@ impl EventStore for PostgresEventStore {
         config: Option<EventProcessingConfig>,
     ) -> Result<()> {
         let config = config.unwrap_or_default();
-        
         let handler_name = H::name().to_string();
         info!("Starting handler for {}", handler_name);
         
@@ -862,53 +861,58 @@ impl EventStore for PostgresEventStore {
                 info!("Handler {} already has offsets, skipping initialization", handler_name);
             }
             
-            // Use a semaphore to limit concurrent stream processing
-            let semaphore = Arc::new(tokio::sync::Semaphore::new(20));
-            let handler_name_clone = handler_name.clone();
+            // Use a concurrent task limit - adjust based on node count in production
+            let max_concurrent_streams = 10;
             
             loop {
-                // Process a limited number of streams
-                let permit = match semaphore.clone().acquire_owned().await {
-                    Ok(permit) => permit,
-                    Err(_) => break, // Semaphore closed, exit loop
+                // Find streams that need processing (limited by max_concurrent_streams)
+                let streams = match store.find_streams_to_process(H::name(), max_concurrent_streams).await {
+                    Ok(streams) => streams,
+                    Err(e) => {
+                        error!("Error finding streams to process: {}", e);
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
                 };
                 
-                let process_span = info_span!("process_streams", handler = %handler_name_clone);
-                let _process_guard = process_span.enter();
-                
-                let store_clone = store.clone();
-                let handler_clone = handler.clone();
-                let config_clone = config.clone();
-                let handler_name_for_task = handler_name_clone.clone(); // Create a new clone specifically for the task
-                
-                // Process streams in a separate task to avoid blocking
-                tokio::spawn(async move {
-                    match store_clone.process_streams(&handler_clone, &config_clone, 10).await {
-                        Ok(processed) => {
-                            if processed > 0 {
-                                debug!("Processed {} streams for handler: {}", processed, handler_name_for_task);
+                if streams.is_empty() {
+                    // Wait for notification or timeout before checking again
+                    tokio::select! {
+                        notification = listener.recv() => {
+                            match notification {
+                                Ok(_) => debug!("Received notification of new event for handler: {}", handler_name),
+                                Err(e) => error!("Error receiving notification: {}", e),
                             }
-                        },
-                        Err(e) => {
-                            error!("Error processing streams for handler {}: {}", handler_name_for_task, e);
+                        }
+                        _ = tokio::time::sleep(config.poll_interval) => {
+                            // Regular polling interval
                         }
                     }
-                    // Permit is dropped automatically when this task completes
-                    drop(permit);
+                    continue;
+                }
+                
+                // Process each stream concurrently (but limited to max_concurrent_streams)
+                let futures = streams.into_iter().map(|(stream_name, stream_id, last_position, is_retry)| {
+                    let store_clone = store.clone();
+                    let handler_clone = handler.clone();
+                    let config_clone = config.clone();
+                    
+                    async move {
+                        if let Err(e) = store_clone.process_stream_with_known_position(
+                            &handler_clone,
+                            &stream_name,
+                            &stream_id,
+                            last_position,
+                            is_retry,
+                            &config_clone
+                        ).await {
+                            error!("Failed to process stream {}/{}: {}", stream_name, stream_id, e);
+                        }
+                    }
                 });
                 
-                // Wait for notification or timeout
-                tokio::select! {
-                    notification = listener.recv() => {
-                        match notification {
-                            Ok(_) => debug!("Received notification of new event for handler: {}", handler_name_clone),
-                            Err(e) => error!("Error receiving notification: {}", e),
-                        }
-                    }
-                    _ = tokio::time::sleep(config.poll_interval) => {
-                        // Regular polling interval
-                    }
-                }
+                // Wait for all streams to be processed before finding more
+                futures::future::join_all(futures).await;
             }
         });
         
