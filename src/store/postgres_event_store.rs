@@ -1,7 +1,8 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow};
-use sqlx::{postgres::{PgPool, PgListener, PgPoolOptions}, postgres::PgRow, Row, Executor, PgExecutor, FromRow};
+use sqlx::postgres::PgPoolOptions;
+use sqlx::{postgres::{PgPool, PgListener}, postgres::PgRow, Row, Executor, PgExecutor, FromRow};
 use uuid::Uuid;
 use tracing::{debug, error, info, info_span, instrument, trace, warn, Span};
 use tokio::sync::broadcast;
@@ -34,7 +35,9 @@ impl PostgresEventStore {
     /// Create a new PostgreSQL event store with the given connection string
     pub async fn new(connection_string: &str) -> Result<Self> {
         let pool = PgPoolOptions::new()
-            .max_connections(30)  // Increase this for more concurrency
+            .max_connections(100)  // Increased from 30
+            .acquire_timeout(Duration::from_secs(15))  // Add timeout
+            .idle_timeout(Duration::from_secs(60))  // Clean up idle connections
             .connect(connection_string)
             .await
             .map_err(|e| anyhow!("Failed to create pool: {}", e))?;
@@ -296,26 +299,49 @@ impl PostgresEventStore {
             debug!("Processing stream as a retry");
         }
         
-        // Acquire a dedicated connection from the pool
-        let mut conn = self.pool.acquire().await?;
+        // Acquire a dedicated connection from the pool with timeout
+        let mut conn = match tokio::time::timeout(
+            Duration::from_secs(5), 
+            self.pool.acquire()
+        ).await {
+            Ok(Ok(conn)) => conn,
+            Ok(Err(e)) => return Err(anyhow!("Failed to acquire connection: {}", e)),
+            Err(_) => return Err(anyhow!("Timed out acquiring connection from pool")),
+        };
         
         // Generate lock key
         let lock_key = self.advisory_lock_key(stream_name, stream_id, handler_name);
-        println!("DIAGNOSTIC: Acquiring lock {} on dedicated connection", lock_key);
         
-        // Try to acquire the lock on this specific connection
-        let row = sqlx::query("SELECT pg_try_advisory_lock($1)")
-            .bind(lock_key)
-            .fetch_one(&mut *conn)
-            .await?;
+        // Disable verbose logging in production
+        #[cfg(debug_assertions)]
+        debug!("Acquiring lock {} on dedicated connection", lock_key);
         
-        let acquired = row.get::<bool, _>(0);
+        // Try to acquire the lock on this specific connection with timeout
+        let acquired = match tokio::time::timeout(
+            Duration::from_secs(3),
+            sqlx::query("SELECT pg_try_advisory_lock($1)")
+                .bind(lock_key)
+                .fetch_one(&mut *conn)
+        ).await {
+            Ok(Ok(row)) => row.get::<bool, _>(0),
+            Ok(Err(e)) => {
+                error!("Error acquiring lock: {}", e);
+                return Ok(());
+            },
+            Err(_) => {
+                warn!("Lock acquisition timed out for {}/{}, handler={}", 
+                    stream_name, stream_id, handler_name);
+                return Ok(());
+            }
+        };
+        
         if !acquired {
-            println!("DIAGNOSTIC: Could not acquire lock {} on dedicated connection", lock_key);
+            debug!("Could not acquire lock {} on dedicated connection", lock_key);
             return Ok(());
         }
         
-        println!("DIAGNOSTIC: Successfully acquired lock {} on dedicated connection", lock_key);
+        #[cfg(debug_assertions)]
+        debug!("Successfully acquired lock {} on dedicated connection", lock_key);
         
         // Process the stream
         let result = self.process_stream_with_lock(
@@ -328,15 +354,16 @@ impl PostgresEventStore {
         ).await;
         
         // Release the lock on the same connection
-        println!("DIAGNOSTIC: Releasing lock {} on dedicated connection", lock_key);
+        #[cfg(debug_assertions)]
+        debug!("Releasing lock {} on dedicated connection", lock_key);
+        
         let release_result = sqlx::query("SELECT pg_advisory_unlock($1)")
             .bind(lock_key)
             .execute(&mut *conn)
             .await;
         
-        match release_result {
-            Ok(_) => println!("DIAGNOSTIC: Successfully released lock {} on dedicated connection", lock_key),
-            Err(e) => println!("DIAGNOSTIC: Failed to release lock {}: {}", lock_key, e),
+        if let Err(e) = release_result {
+            error!("Failed to release lock {}: {}", lock_key, e);
         }
         
         // Return the original result
@@ -783,8 +810,21 @@ impl EventStore for PostgresEventStore {
         info!("Starting handler for {}", handler_name);
         
         // Create a listener for new events
-        let mut listener = PgListener::connect_with(&self.pool).await?;
-        listener.listen("new_event").await?;
+        let mut listener = match PgListener::connect_with(&self.pool).await {
+            Ok(listener) => listener,
+            Err(e) => {
+                error!("Failed to create PgListener: {}", e);
+                return Err(anyhow!("Failed to create listener: {}", e));
+            }
+        };
+        
+        match listener.listen("new_event").await {
+            Ok(_) => {},
+            Err(e) => {
+                error!("Failed to listen to new_event channel: {}", e);
+                return Err(anyhow!("Failed to listen: {}", e));
+            }
+        };
         
         let store = self.clone();
         
@@ -808,44 +848,60 @@ impl EventStore for PostgresEventStore {
             if !handler_has_offsets {
                 // Set the initial processing strategy based on config
                 if config.start_from_beginning {
-                    // This will make the handler process all events from the beginning
                     match store.initialize_handler_at_beginning::<H>().await {
                         Ok(_) => info!("Handler configured to start from beginning"),
                         Err(e) => error!("Failed to initialize handler {} at beginning: {}", handler_name, e),
                     }
                 } else if config.start_from_current {
-                    // This will make the handler start from the current position
                     match store.initialize_handler_at_current_position::<H>().await {
                         Ok(count) => info!("Handler {} initialized at current position for {} new streams", handler_name, count),
                         Err(e) => error!("Failed to initialize handler {} at current position: {}", handler_name, e),
                     }
                 }
-                // Default behavior: process streams with no offsets from the beginning
             } else {
                 info!("Handler {} already has offsets, skipping initialization", handler_name);
             }
             
+            // Use a semaphore to limit concurrent stream processing
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(20));
+            
             loop {
-                // Break on shutdown signal
+                // Process a limited number of streams
+                let permit = match semaphore.clone().acquire_owned().await {
+                    Ok(permit) => permit,
+                    Err(_) => break, // Semaphore closed, exit loop
+                };
                 
                 let process_span = info_span!("process_streams", handler = %handler_name);
                 let _process_guard = process_span.enter();
-                match store.process_streams(&handler, &config, 30).await {
-                    Ok(processed) => {
-                        if processed > 0 {
-                            debug!("Processed {} streams for handler: {}", processed, handler_name);
+                
+                let store_clone = store.clone();
+                let handler_clone = handler.clone();
+                let config_clone = config.clone();
+                
+                // Process streams in a separate task to avoid blocking
+                tokio::spawn(async move {
+                    match store_clone.process_streams(&handler_clone, &config_clone, 10).await {
+                        Ok(processed) => {
+                            if processed > 0 {
+                                debug!("Processed {} streams for handler: {}", processed, handler_name);
+                            }
+                        },
+                        Err(e) => {
+                            error!("Error processing streams for handler {}: {}", handler_name, e);
                         }
-                    },
-                    Err(e) => {
-                        error!("Error processing streams for handler {}: {}", handler_name, e);
                     }
-                }
-                drop(_process_guard);
+                    // Permit is dropped automatically when this task completes
+                    drop(permit);
+                });
                 
                 // Wait for notification or timeout
                 tokio::select! {
-                    _ = listener.recv() => {
-                        debug!("Received notification of new event for handler: {}", handler_name);
+                    notification = listener.recv() => {
+                        match notification {
+                            Ok(_) => debug!("Received notification of new event for handler: {}", handler_name),
+                            Err(e) => error!("Error receiving notification: {}", e),
+                        }
                     }
                     _ = tokio::time::sleep(config.poll_interval) => {
                         // Regular polling interval
