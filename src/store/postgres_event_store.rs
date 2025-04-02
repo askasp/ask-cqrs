@@ -76,8 +76,7 @@ impl PostgresEventStore {
             Duration::from_secs(backoff)
         };
         
-        // Utc::now() + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::seconds(60))
-        Utc::now() - chrono::Duration::hours(1)
+        Utc::now() + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::seconds(60))
     }
 
     /// Find streams that need processing for a handler, including their current positions
