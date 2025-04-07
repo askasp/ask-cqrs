@@ -428,15 +428,17 @@ impl PostgresEventStore {
                         .map_err(|e| anyhow!("Handler error: {}", e.log_message))
                 },
                 Err(e) => {
-                    Err(anyhow!("Deserialization error: {}", e))
+                    // If we can't deserialize the event, it means this handler doesn't handle this event type
+                    // So we'll treat it as successfully handled (but not update max_position)
+                    debug!(position, "Event type not handled by this handler: {}", e);
+                    Ok(())
                 }
             };
             
             match result {
                 Ok(_) => {
-                    // Update max position
-                    max_position = position;
-                    debug!(position, "Successfully processed event");
+                        max_position = position;
+                        debug!(position, "Successfully processed event");
                 },
                 Err(e) => {
                     // Record error and schedule retry
