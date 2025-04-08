@@ -429,7 +429,7 @@ impl PostgresEventStore {
                 },
                 Err(e) => {
                     // If we can't deserialize the event, it means this handler doesn't handle this event type
-                    // So we'll treat it as successfully handled (but not update max_position)
+                    // We'll treat it as successfully handled AND update the position
                     debug!(position, "Event type not handled by this handler: {}", e);
                     Ok(())
                 }
@@ -437,8 +437,9 @@ impl PostgresEventStore {
             
             match result {
                 Ok(_) => {
-                        max_position = position;
-                        debug!(position, "Successfully processed event");
+                    // Always update max_position when we successfully process (or skip) an event
+                    max_position = position;
+                    debug!(position, "Successfully processed or skipped event");
                 },
                 Err(e) => {
                     // Record error and schedule retry
