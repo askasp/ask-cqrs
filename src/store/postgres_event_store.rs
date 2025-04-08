@@ -151,7 +151,7 @@ impl PostgresEventStore {
         // Process each stream SEQUENTIALLY instead of concurrently
         let mut processed_count = 0;
         for (stream_name, stream_id, last_position, is_retry) in streams {
-            match self.process_stream_with_known_position(
+            if let Err(e) = self.process_stream_with_known_position(
                 handler,
                 &stream_name,
                 &stream_id,
@@ -159,8 +159,9 @@ impl PostgresEventStore {
                 is_retry,
                 config
             ).await {
-                Ok(_) => processed_count += 1,
-                Err(e) => error!("Failed to process stream {}/{}: {}", stream_name, stream_id, e),
+                error!("Failed to process stream {}/{}: {}", stream_name, stream_id, e);
+            } else {
+                processed_count += 1;
             }
         }
         
@@ -189,54 +190,16 @@ impl PostgresEventStore {
         handler_name: &str,
     ) -> Result<bool> {
         let lock_key = self.advisory_lock_key(stream_name, stream_id, handler_name);
-        
-        info!(
-            lock_key = lock_key,
-            stream = %format!("{}/{}", stream_name, stream_id),
-            handler = %handler_name,
-            "Attempting to acquire advisory lock"
-        );
-                 
-        // Check if lock is already held by someone
-        let holders_row = sqlx::query(
-            "SELECT pid, locktype, mode, granted 
-             FROM pg_locks 
-             WHERE locktype = 'advisory' AND objid = $1"
-        )
-            .bind(lock_key as i64)
-            .fetch_all(&self.pool)
-            .await?;
-            
-        if !holders_row.is_empty() {
-            for row in &holders_row {
-                let pid: i32 = row.get("pid");
-                let mode: String = row.get("mode");
-                let granted: bool = row.get("granted");
-                warn!(
-                    lock_key = lock_key,
-                    pid = pid,
-                    mode = %mode,
-                    granted = granted,
-                    "Found existing advisory lock holder"
-                );
-            }
-        }
-        
-        // Use session-level lock instead of transaction-level lock
-        let row = sqlx::query("SELECT pg_try_advisory_lock($1) as acquired")
+        let acquired = sqlx::query("SELECT pg_try_advisory_lock($1)")
             .bind(lock_key)
             .fetch_one(&self.pool)
-            .await?;
-            
-        let acquired = row.get::<bool, _>("acquired");
+            .await?
+            .get::<bool, _>(0);
         
-        info!(
-            lock_key = lock_key,
-            stream = %format!("{}/{}", stream_name, stream_id),
-            handler = %handler_name,
-            acquired = acquired,
-            "Advisory lock acquisition attempt completed"
-        );
+        if !acquired {
+            debug!("Could not acquire lock for {}/{} (handler: {})", 
+                   stream_name, stream_id, handler_name);
+        }
         
         Ok(acquired)
     }
@@ -934,28 +897,19 @@ impl EventStore for PostgresEventStore {
                     continue;
                 }
                 
-                // Process each stream concurrently (but limited to max_concurrent_streams)
-                let futures = streams.into_iter().map(|(stream_name, stream_id, last_position, is_retry)| {
-                    let store_clone = store.clone();
-                    let handler_clone = handler.clone();
-                    let config_clone = config.clone();
-                    
-                    async move {
-                        if let Err(e) = store_clone.process_stream_with_known_position(
-                            &handler_clone,
-                            &stream_name,
-                            &stream_id,
-                            last_position,
-                            is_retry,
-                            &config_clone
-                        ).await {
-                            error!("Failed to process stream {}/{}: {}", stream_name, stream_id, e);
-                        }
+                // Process each stream sequentially
+                for (stream_name, stream_id, last_position, is_retry) in streams {
+                    if let Err(e) = store.process_stream_with_known_position(
+                        &handler,
+                        &stream_name,
+                        &stream_id,
+                        last_position,
+                        is_retry,
+                        &config
+                    ).await {
+                        error!("Failed to process stream {}/{}: {}", stream_name, stream_id, e);
                     }
-                });
-                
-                // Wait for all streams to be processed before finding more
-                futures::future::join_all(futures).await;
+                }
             }
         });
         
