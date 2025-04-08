@@ -70,3 +70,6 @@ CREATE TABLE IF NOT EXISTS view_snapshots (
 
 -- Index for efficient view snapshot lookups
 CREATE INDEX IF NOT EXISTS idx_view_snapshots_lookup ON view_snapshots(view_name, partition_key);
+CREATE INDEX IF NOT EXISTS idx_handler_stream_offsets_lookup
+    ON handler_stream_offsets (handler, stream_name, stream_id, last_position)
+    WHERE dead_lettered = FALSE;
