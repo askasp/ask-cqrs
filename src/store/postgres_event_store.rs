@@ -35,9 +35,12 @@ impl PostgresEventStore {
     /// Create a new PostgreSQL event store with the given connection string
     pub async fn new(connection_string: &str) -> Result<Self> {
         let pool = PgPoolOptions::new()
-            .max_connections(5)  // Increased from 30
-            .acquire_timeout(Duration::from_secs(15))  // Add timeout
-            .idle_timeout(Duration::from_secs(60))  // Clean up idle connections
+            .max_connections(10)  // Increased to handle multiple concurrent handlers:
+                                // - Each handler processes max_concurrent_streams (2) at a time
+                                // - Each stream requires a dedicated connection for advisory locking
+                                // - Additional connections needed for background tasks
+            .acquire_timeout(Duration::from_secs(15))
+            .idle_timeout(Duration::from_secs(60))
             .connect(connection_string)
             .await
             .map_err(|e| anyhow!("Failed to create pool: {}", e))?;
@@ -211,29 +214,53 @@ impl PostgresEventStore {
     ) -> Result<bool> {
         let lock_key = self.advisory_lock_key(stream_name, stream_id, handler_name);
         
-        // Debug: Print when attempting to acquire lock
-        println!("LOCK: Attempting to acquire lock with key {} for {}/{}, handler={}", 
-                 lock_key, stream_name, stream_id, handler_name);
+        info!(
+            lock_key = lock_key,
+            stream = %format!("{}/{}", stream_name, stream_id),
+            handler = %handler_name,
+            "Attempting to acquire advisory lock"
+        );
                  
         // Check if lock is already held by someone
-        let holders_row = sqlx::query("SELECT count(*) as lock_count FROM pg_locks WHERE locktype = 'advisory' AND objid = $1")
+        let holders_row = sqlx::query(
+            "SELECT pid, locktype, mode, granted 
+             FROM pg_locks 
+             WHERE locktype = 'advisory' AND objid = $1"
+        )
             .bind(lock_key as i64)
-            .fetch_one(&self.pool)
+            .fetch_all(&self.pool)
             .await?;
             
-        let lock_count: i64 = holders_row.get("lock_count");
-        println!("LOCK: Found {} existing holders for lock key {}", lock_count, lock_key);
+        if !holders_row.is_empty() {
+            for row in &holders_row {
+                let pid: i32 = row.get("pid");
+                let mode: String = row.get("mode");
+                let granted: bool = row.get("granted");
+                warn!(
+                    lock_key = lock_key,
+                    pid = pid,
+                    mode = %mode,
+                    granted = granted,
+                    "Found existing advisory lock holder"
+                );
+            }
+        }
         
         // Use session-level lock instead of transaction-level lock
-        let row = sqlx::query("SELECT pg_try_advisory_lock($1)")
+        let row = sqlx::query("SELECT pg_try_advisory_lock($1) as acquired")
             .bind(lock_key)
             .fetch_one(&self.pool)
             .await?;
             
-        let acquired = row.get::<bool, _>(0);
+        let acquired = row.get::<bool, _>("acquired");
         
-        // Debug: Print lock acquisition result
-        println!("LOCK: Lock acquisition result for key {}: {}", lock_key, acquired);
+        info!(
+            lock_key = lock_key,
+            stream = %format!("{}/{}", stream_name, stream_id),
+            handler = %handler_name,
+            acquired = acquired,
+            "Advisory lock acquisition attempt completed"
+        );
         
         Ok(acquired)
     }
@@ -247,28 +274,50 @@ impl PostgresEventStore {
     ) -> Result<()> {
         let lock_key = self.advisory_lock_key(stream_name, stream_id, handler_name);
         
-        // Debug: Print when attempting to release lock
-        println!("LOCK: Attempting to release lock with key {} for {}/{}, handler={}", 
-                 lock_key, stream_name, stream_id, handler_name);
+        info!(
+            lock_key = lock_key,
+            stream = %format!("{}/{}", stream_name, stream_id),
+            handler = %handler_name,
+            "Attempting to release advisory lock"
+        );
                  
         // Query to release lock
-        let result = sqlx::query("SELECT pg_advisory_unlock($1)")
+        let result = sqlx::query("SELECT pg_advisory_unlock($1) as released")
             .bind(lock_key)
             .execute(&self.pool)
             .await?;
             
-        // Debug: Print release result
-        println!("LOCK: Lock release for key {}: executed with {} rows affected", 
-                 lock_key, result.rows_affected());
-                 
-        // Verify the lock was released
-        let holders_row = sqlx::query("SELECT count(*) as lock_count FROM pg_locks WHERE locktype = 'advisory' AND objid = $1")
+        // Verify the lock was released by checking current holders
+        let holders_row = sqlx::query(
+            "SELECT pid, locktype, mode, granted 
+             FROM pg_locks 
+             WHERE locktype = 'advisory' AND objid = $1"
+        )
             .bind(lock_key as i64)
-            .fetch_one(&self.pool)
+            .fetch_all(&self.pool)
             .await?;
             
-        let lock_count: i64 = holders_row.get("lock_count");
-        println!("LOCK: After release, found {} existing holders for lock key {}", lock_count, lock_key);
+        if !holders_row.is_empty() {
+            for row in &holders_row {
+                let pid: i32 = row.get("pid");
+                let mode: String = row.get("mode");
+                let granted: bool = row.get("granted");
+                warn!(
+                    lock_key = lock_key,
+                    pid = pid,
+                    mode = %mode,
+                    granted = granted,
+                    "Lock still has holders after release attempt"
+                );
+            }
+        } else {
+            info!(
+                lock_key = lock_key,
+                stream = %format!("{}/{}", stream_name, stream_id),
+                handler = %handler_name,
+                "Advisory lock successfully released"
+            );
+        }
         
         Ok(())
     }
@@ -298,12 +347,28 @@ impl PostgresEventStore {
             debug!("Processing stream as a retry");
         }
         
+        // Log pool stats before acquiring connection
+        let pool_size = self.pool.size();
+        let idle_conns = self.pool.num_idle();
+        info!(
+            pool_size = pool_size,
+            idle_connections = idle_conns,
+            "Connection pool status before acquiring connection"
+        );
+        
         // Acquire a dedicated connection from the pool with timeout
         let mut conn = match tokio::time::timeout(
             Duration::from_secs(5), 
             self.pool.acquire()
         ).await {
-            Ok(Ok(conn)) => conn,
+            Ok(Ok(conn)) => {
+                info!(
+                    pool_size = self.pool.size(),
+                    idle_connections = self.pool.num_idle(),
+                    "Successfully acquired connection from pool"
+                );
+                conn
+            },
             Ok(Err(e)) => return Err(anyhow!("Failed to acquire connection: {}", e)),
             Err(_) => return Err(anyhow!("Timed out acquiring connection from pool")),
         };
