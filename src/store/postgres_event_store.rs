@@ -35,7 +35,7 @@ impl PostgresEventStore {
     /// Create a new PostgreSQL event store with the given connection string
     pub async fn new(connection_string: &str) -> Result<Self> {
         let pool = PgPoolOptions::new()
-            .max_connections(30)  // Increased from 30
+            .max_connections(5)  // Increased from 30
             .acquire_timeout(Duration::from_secs(15))  // Add timeout
             .idle_timeout(Duration::from_secs(60))  // Clean up idle connections
             .connect(connection_string)
@@ -864,7 +864,7 @@ impl EventStore for PostgresEventStore {
             }
             
             // Use a concurrent task limit - adjust based on node count in production
-            let max_concurrent_streams = 10;
+            let max_concurrent_streams = 2;
             
             loop {
                 // Find streams that need processing (limited by max_concurrent_streams)
