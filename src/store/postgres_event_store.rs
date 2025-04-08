@@ -35,26 +35,13 @@ impl PostgresEventStore {
     /// Create a new PostgreSQL event store with the given connection string
     pub async fn new(connection_string: &str) -> Result<Self> {
         let pool = PgPoolOptions::new()
-            .max_connections(10)  // Increased to handle multiple concurrent handlers:
-                                // - Each handler processes max_concurrent_streams (2) at a time
-                                // - Each stream requires a dedicated connection for advisory locking
-                                // - Additional connections needed for background tasks
+            .max_connections(50)  // Still reasonable for a 2-core system
             .acquire_timeout(Duration::from_secs(15))
             .idle_timeout(Duration::from_secs(60))
             .connect(connection_string)
-            .await
-            .map_err(|e| anyhow!("Failed to create pool: {}", e))?;
+            .await?;
 
-        // Generate a unique node ID for this instance
-
-        let store = Self { 
-            pool,
-        };
-
-        // Initialize schema if needed
-        //store.initialize().await?;
-
-        Ok(store)
+        Ok(Self { pool })
     }
 
     pub fn create_view_store(&self) -> PostgresViewStore {
@@ -143,7 +130,7 @@ impl PostgresEventStore {
         Ok(streams)
     }
     
-    /// Process streams for a handler
+    /// Process streams sequentially instead of concurrently
     #[instrument(skip(self, handler, config))]
     async fn process_streams<H>(
         &self,
@@ -161,33 +148,22 @@ impl PostgresEventStore {
             return Ok(0);
         }
         
-        // Process each stream concurrently
-        let results = join_all(
-            streams.into_iter().map(|(stream_name, stream_id, last_position, is_retry)| {
-                let store_clone = self.clone();
-                let handler_clone = handler.clone();
-                let config_clone = config.clone();
-                println!("Processing stream: {:?}", stream_name);
-                
-                async move {
-                    store_clone.process_stream_with_known_position(
-                        &handler_clone,
-                        &stream_name,
-                        &stream_id,
-                        last_position,
-                        is_retry,
-                        &config_clone
-                    ).await
-                }
-            })
-        ).await;
+        // Process each stream SEQUENTIALLY instead of concurrently
+        let mut processed_count = 0;
+        for (stream_name, stream_id, last_position, is_retry) in streams {
+            match self.process_stream_with_known_position(
+                handler,
+                &stream_name,
+                &stream_id,
+                last_position,
+                is_retry,
+                config
+            ).await {
+                Ok(_) => processed_count += 1,
+                Err(e) => error!("Failed to process stream {}/{}: {}", stream_name, stream_id, e),
+            }
+        }
         
-        // Count successful processing
-        let processed_count = results.into_iter()
-            .filter(|r| r.is_ok())
-            .count();
-        
-        // Raise to info level if processed streams > 0
         if processed_count > 0 {
             info!(handler = %H::name(), "Processed {} streams", processed_count);
         }
