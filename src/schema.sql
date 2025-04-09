@@ -16,21 +16,6 @@ CREATE INDEX IF NOT EXISTS idx_events_stream_id ON events(stream_id);
 CREATE INDEX IF NOT EXISTS idx_events_streamname_streamid_position
     ON events (stream_name, stream_id, stream_position, id);
 
--- Notification function and trigger for new events
-CREATE OR REPLACE FUNCTION notify_new_event() RETURNS TRIGGER AS $$
-BEGIN
-    PERFORM pg_notify('new_event', NEW.id::text);
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
--- Drop and recreate trigger (triggers can't use IF NOT EXISTS)
-DROP TRIGGER IF EXISTS events_notify_trigger ON events;
-CREATE TRIGGER events_notify_trigger
-    AFTER INSERT ON events
-    FOR EACH ROW
-    EXECUTE FUNCTION notify_new_event();
-
 -- Track event processing progress with integrated retry/dead-letter logic
 CREATE TABLE IF NOT EXISTS handler_stream_offsets (
     handler TEXT NOT NULL,
@@ -56,6 +41,16 @@ CREATE INDEX IF NOT EXISTS idx_handler_stream_retry_ready
 CREATE INDEX IF NOT EXISTS idx_handler_stream_dead_lettered
     ON handler_stream_offsets (handler, last_updated_at)
     WHERE dead_lettered = TRUE;
+
+-- Add claimed_by and claimed_until columns to handler_stream_offsets
+ALTER TABLE handler_stream_offsets 
+    ADD COLUMN IF NOT EXISTS claimed_by TEXT,
+    ADD COLUMN IF NOT EXISTS claimed_until TIMESTAMP WITH TIME ZONE;
+
+-- Add index for finding unclaimed streams
+CREATE INDEX IF NOT EXISTS idx_handler_stream_unclaimed
+    ON handler_stream_offsets (handler, claimed_until)
+    WHERE claimed_by IS NULL OR claimed_until IS NOT NULL;
 
 -- View snapshots for caching view state
 CREATE TABLE IF NOT EXISTS view_snapshots (

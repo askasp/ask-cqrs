@@ -156,7 +156,7 @@ async fn test_competing_consumers() -> Result<()> {
     
     for i in 0..num_nodes {
         let store = create_test_store("postgres://postgres:postgres@localhost:5432/ask_cqrs_test2").await?;
-        let node_id = format!("node-{}", i);
+        let node_id = store.node_id.clone();
         node_ids.push(node_id.clone());
         
         let handler = CompetingConsumerHandler::new(
@@ -247,7 +247,12 @@ async fn test_competing_consumers() -> Result<()> {
         
         info!("Stream {} processed by nodes: {:?}", stream_id, stream_node_counts);
     }
-    
+
+    // Add a small delay to allow background tasks to settle before cleanup
+    info!("Waiting for background tasks to settle...");
+    tokio::time::sleep(Duration::from_millis(500)).await; // Adjust duration as needed
+    info!("Finished waiting.");
+
     // Cleanup
     
     Ok(())

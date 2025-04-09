@@ -1,17 +1,19 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use serde_json::{self, json, Value as JsonValue};
+use serde_json::{self, Value as JsonValue};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{
     postgres::{PgListener, PgPool},
-     PgExecutor, Row,
+    Row,
 };
-use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
+use std::sync::Arc;
+use std::time::Duration;
 use tracing::{debug, error, info, info_span, instrument, trace, warn, Span};
 use uuid::Uuid;
 use std::collections::HashMap;
-use futures::future::join_all;
 
+use crate::store::{StreamClaim, StreamClaimer};
 use crate::view_event_handler::ViewEventHandler;
 use crate::{
     aggregate::Aggregate,
@@ -30,6 +32,7 @@ use super::PostgresViewStore;
 #[derive(Clone)]
 pub struct PostgresEventStore {
     pub pool: PgPool,
+    pub node_id: String,
 }
 
 impl PostgresEventStore {
@@ -42,7 +45,8 @@ impl PostgresEventStore {
             .connect(connection_string)
             .await?;
 
-        Ok(Self { pool })
+        let node_id = Uuid::new_v4().to_string();
+        Ok(Self { pool, node_id })
     }
     pub fn get_pool(&self) -> &PgPool {
         &self.pool
@@ -114,27 +118,10 @@ impl EventStore for PostgresEventStore {
     ) -> Result<()> {
         let config = config.unwrap_or_default();
         let handler_name = H::name().to_string();
-        info!("Starting handler for {}", handler_name);
-        // Create a listener for new events
-        let mut listener = match PgListener::connect_with(&self.pool).await {
-            Ok(listener) => listener,
-            Err(e) => {
-                error!("Failed to create PgListener: {}", e);
-                return Err(anyhow!("Failed to create listener: {}", e));
-            }
-        };
+        let handler = handler.clone();
+        let node_id = self.node_id.clone();
 
-        match listener.listen("new_event").await {
-            Ok(_) => {
-                debug!("Successfully subscribed to 'new_event' notification channel");
-            }
-            Err(e) => {
-                error!("Failed to listen to new_event channel: {}", e);
-                return Err(anyhow!("Failed to listen: {}", e));
-            }
-        };
-
-        let store = self.clone();
+        let store = Arc::new(self.clone());
 
         // Start a single processing thread
         tokio::spawn(async move {
@@ -144,173 +131,52 @@ impl EventStore for PostgresEventStore {
             info!("Starting event processor for handler: {}", handler_name);
 
             // Create an event processor with a dedicated connection
-            let mut processor = match EventProcessor::new(&store).await {
+            let  processor = match EventProcessor::new(&store).await {
                 Ok(processor) => processor,
                 Err(e) => {
                     error!("Failed to create event processor: {}", e);
                     return;
                 }
             };
+            let _ = processor.initialize_offsets(&handler_name, &config).await;
 
-            // Check if this handler already has any offsets
-            let handler_has_offsets = match processor.handler_has_offsets(&handler_name).await {
-                Ok(has_offsets) => has_offsets,
-                Err(e) => {
-                    error!(
-                        "Failed to check if handler {} has offsets: {}",
-                        handler_name, e
-                    );
-                    false
-                }
-            };
+           
+            let (sender, mut receiver) = mpsc::channel::<StreamClaim>(100); // Capacity of 100
+            let stream_claimer = StreamClaimer::new(&store, handler_name.clone()).await.unwrap();
+            let arc_stream_claimer = Arc::new(stream_claimer);
+            let arc_stream_claimer_clone = arc_stream_claimer.clone();
+            info!("Starting stream claimer for handler: {}", handler_name);
+            tokio::spawn(async move {
+                info!("Starting stream claimer for handler in thread");
+                arc_stream_claimer_clone.start_claiming(sender, &node_id).await;
+            });
+            
+            // Create a processor that can be cloned
+            let processor = Arc::new(processor);
+            
+            while let Some(stream_claim) = receiver.recv().await {
+                // Clone necessary data for the task
+                let handler_name_clone = handler_name.clone();
+                let config_clone = config.clone();
+                let processor_clone = Arc::clone(&processor);
+                let handler_clone = handler.clone();
 
-            // Only initialize if the handler doesn't have offsets yet
-            if !handler_has_offsets {
-                // Set the initial processing strategy based on config
-                if config.start_from_beginning {
-                    match processor.initialize_handler_at_beginning::<H>().await {
-                        Ok(_) => info!("Handler configured to start from beginning"),
-                        Err(e) => error!(
-                            "Failed to initialize handler {} at beginning: {}",
-                            handler_name, e
-                        ),
-                    }
-                } else if config.start_from_current {
-                    match processor
-                        .initialize_handler_at_current_position::<H>()
-                        .await
-                    {
-                        Ok(count) => info!(
-                            "Handler {} initialized at current position for {} new streams",
-                            handler_name, count
-                        ),
-                        Err(e) => error!(
-                            "Failed to initialize handler {} at current position: {}",
-                            handler_name, e
-                        ),
-                    }
-                }
-            } else {
-                info!(
-                    "Handler {} already has offsets, skipping initialization",
-                    handler_name
-                );
-            }
-
-            // Generate handler lock key
-            let handler_lock_key = {
-                use std::collections::hash_map::DefaultHasher;
-                use std::hash::{Hash, Hasher};
-                let mut hasher = DefaultHasher::new();
-                format!("handler:{}", handler_name).hash(&mut hasher);
-                hasher.finish() as i64
-            };
-
-            let max_concurrent_streams = 10;
-
-            loop {
-                // Try to acquire handler lock
-                let acquired = match sqlx::query("SELECT pg_try_advisory_lock($1)")
-                    .bind(handler_lock_key)
-                    .fetch_one(&mut *processor.conn)
-                    .await
-                {
-                    Ok(row) => row.get::<bool, _>(0),
-                    Err(e) => {
-                        error!("Error acquiring handler lock: {}", e);
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        continue;
-                    }
-                };
-
-                if !acquired {
-                    info!(
-                        "Handler {} is being processed by another node",
-                        handler_name
-                    );
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    continue;
-                }
-
-                info!("Acquired lock for handler {}", handler_name);
-
-                // Process events in order by stream
-                let events: Vec<EventRow> = processor.find_events_to_process(&handler_name, max_concurrent_streams).await.unwrap();
-                println!("Found {} events to process", events.len());
-
-                if events.is_empty() {
-                    // Release lock and wait for notifications as before
-                    let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
-                        .bind(handler_lock_key)
-                        .execute(&mut *processor.conn)
-                        .await;
-
-                    // Wait for notification or timeout
-                    tokio::select! {
-                        notification = listener.recv() => {
-                            match notification {
-                                Ok(_) => debug!("Received notification of new event for handler: {}", handler_name),
-                                Err(e) => error!("Error receiving notification: {}", e),
-                            }
-                        }
-                        _ = tokio::time::sleep(config.poll_interval) => {
-                            // Regular polling interval
-                        }
-                    }
-                    continue;
-                }
-
-                // Group events by stream
-                let mut events_by_stream: HashMap<(String, String), Vec<EventRow>> = HashMap::new();
-                for event in events {
-                    events_by_stream
-                        .entry((event.stream_name.clone(), event.stream_id.clone()))
-                        .or_default()
-                        .push(event);
-                }
-
-                // Process each stream's events in order
-                for ((_stream_name, _stream_id), stream_events) in events_by_stream {
-                    // Process events in this stream sequentially until error
-                    println!("Processing stream: {}/{}", _stream_name, _stream_id);
-                    
-                    for event in stream_events {
-                        match serde_json::from_value(event.event_data.clone()) {
-                            Err(_) => {
-                                // Event type not handled by this handler, mark as processed
-                                if let Err(e) = processor.set_handler_offset(&handler_name, &event).await {
-                                    error!("Failed to update handler offset: {}", e);
-                                    break; // Stop processing this stream
-                                }
-                            }
-                            Ok(parsed_event) => {
-                                match handler.handle_event(parsed_event, event.clone()).await {
-                                    Ok(_) => {
-                                        if let Err(e) = processor.set_handler_offset(&handler_name, &event).await {
-                                            error!("Failed to update handler offset: {}", e);
-                                            break; // Stop processing this stream
-                                        }
-                                    }
-                                    Err(e) => {
-                                        if let Err(err) = processor.set_processing_error(&handler_name, &event, &e.log_message, &config).await {
-                                            error!("Failed to set processing error: {}", err);
-                                        }
-                                        break; // Stop processing this stream after a failure
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Release handler lock before next iteration
-                let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
-                    .bind(handler_lock_key)
-                    .execute(&mut *processor.conn)
-                    .await;
+                let stream_claimer_clone = arc_stream_claimer.clone();
+                
+                // Spawn a task to process this specific stream
+                tokio::spawn(async move {
+                    let _ = processor_clone.process_stream::<H>(
+                        handler_clone,
+                        &stream_claim.stream_name,
+                        &stream_claim.stream_id,
+                        stream_claim.last_position,
+                        &config_clone,
+                        &handler_name_clone
+                    ).await;
+                    let _ = stream_claimer_clone.release_claim(&stream_claim.stream_name, &stream_claim.stream_id).await;
+                });
             }
         });
-
         Ok(())
     }
     async fn initialize(&self) -> Result<()> {
