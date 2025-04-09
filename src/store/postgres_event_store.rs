@@ -324,8 +324,11 @@ pub async fn initialize_database(connection_string: &str) -> Result<()> {
         // Build the connection string for the new database
         
         // Now connect to the new database and initialize schema
+    warn!("Initializing database");
     let db_pool = PgPool::connect(connection_string).await?;
 
     db_pool.execute(SCHEMA).await.unwrap();
+    warn!("Database initialized");
+
     Ok(())
 }
