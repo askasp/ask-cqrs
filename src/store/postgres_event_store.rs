@@ -45,6 +45,7 @@ impl PostgresEventStore {
             .connect(connection_string)
             .await?;
 
+
         let node_id = Uuid::new_v4().to_string();
         Ok(Self { pool, node_id })
     }
