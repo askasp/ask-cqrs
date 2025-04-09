@@ -12,6 +12,8 @@ use std::time::Duration;
 use tracing::{debug, error, info, info_span, instrument, trace, warn, Span};
 use uuid::Uuid;
 use std::collections::HashMap;
+use sqlx::postgres::{ PgConnectOptions};
+use sqlx::{ConnectOptions, Executor};
 
 use crate::store::{StreamClaim, StreamClaimer};
 use crate::view_event_handler::ViewEventHandler;
@@ -27,6 +29,7 @@ use crate::{
 
 use super::event_processor::EventProcessor;
 use super::PostgresViewStore;
+const SCHEMA: &str = include_str!("../../src/schema.sql");
 
 /// PostgreSQL-based event store implementation
 #[derive(Clone)]
@@ -180,18 +183,7 @@ impl EventStore for PostgresEventStore {
         });
         Ok(())
     }
-    async fn initialize(&self) -> Result<()> {
-        // Read schema file
-        // let schema = include_str!("../../src/schema.sql");
-        let schema = include_str!("../../src/schema.sql");
-
-        sqlx::query(schema)
-            .execute(&self.pool)
-            .await?;
-
-        info!("Database schema initialized");
-        Ok(())
-    }
+    
     async fn execute_command<A: Aggregate>(
         &self,
         command: A::Command,
@@ -326,4 +318,14 @@ impl EventStore for PostgresEventStore {
 
         Ok((state, last_position))
     }
+}
+
+pub async fn initialize_database(connection_string: &str) -> Result<()> {
+        // Build the connection string for the new database
+        
+        // Now connect to the new database and initialize schema
+    let db_pool = PgPool::connect(connection_string).await?;
+
+    db_pool.execute(SCHEMA).await.unwrap();
+    Ok(())
 }

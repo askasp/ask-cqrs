@@ -97,8 +97,6 @@ impl Default for EventProcessingConfig {
 /// Core trait defining the Event Store interface
 #[async_trait]
 pub trait EventStore: Send + Sync + Clone {
-    /// Initialize the event store
-    async fn initialize(&self) -> Result<()>;
     
     
     /// Execute a command and store resulting events
