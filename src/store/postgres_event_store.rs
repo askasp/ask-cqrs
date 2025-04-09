@@ -181,11 +181,12 @@ impl EventStore for PostgresEventStore {
     }
     async fn initialize(&self) -> Result<()> {
         // Read schema file
+        // let schema = include_str!("../../src/schema.sql");
         let schema = include_str!("../../src/schema.sql");
 
-        // sqlx::query_multi_statement(schema)
-        //     .execute(&self.pool)
-        //     .await?;
+        sqlx::query(schema)
+            .execute(&self.pool)
+            .await?;
 
         info!("Database schema initialized");
         Ok(())
