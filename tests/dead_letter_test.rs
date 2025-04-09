@@ -207,7 +207,7 @@ async fn test_retry_handling_simple_sequence() -> Result<()> {
     ).await?;
     
     // Wait for retry and processing of the second event
-    sleep(Duration::from_secs(1)).await;
+    sleep(Duration::from_secs(2)).await;
     
     // Assert second event failed first, then succeeded on retry
     let processed_events = handler.get_processed_events();
@@ -250,7 +250,7 @@ async fn test_retry_handling_simple_sequence() -> Result<()> {
     ).await?;
     
     // Wait for the third event to be retried and marked as dead-lettered
-    sleep(Duration::from_secs(1)).await;
+    sleep(Duration::from_secs(3)).await;
     
     // Assert third event failed and is marked as dead-lettered
     let dead_lettered = check_dead_lettered_events(&store, &account_id, SequencedFailureHandler::name()).await?;

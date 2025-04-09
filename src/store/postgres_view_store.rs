@@ -94,11 +94,6 @@ impl PostgresViewStore {
 
         Ok(row.get::<bool, _>(0))
     }
-    
-    /// Generate a stream key for JSONB lookup
-    fn get_stream_key(stream_name: &str, stream_id: &str) -> String {
-        format!("{}:{}", stream_name, stream_id)
-    }
 }
 
 #[async_trait]
@@ -225,7 +220,7 @@ impl ViewStore for PostgresViewStore {
             condition
         );
 
-        let mut count_builder = sqlx::query(&count_query).bind(view_name.clone());
+        let mut count_builder = sqlx::query(&count_query).bind(view_name);
         for param in &params {
             count_builder = count_builder.bind(param);
         }
@@ -288,7 +283,6 @@ impl ViewStore for PostgresViewStore {
         }
 
         let rows = query_builder.fetch_all(&self.pool).await?;
-        let result_count = rows.len();
         
         let mut items = Vec::with_capacity(rows.len());
         for row in rows {
