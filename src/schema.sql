@@ -1,4 +1,19 @@
 -- Events table for storing all domain events
+
+CREATE OR REPLACE FUNCTION notify_new_event() RETURNS TRIGGER AS $$
+BEGIN
+    PERFORM pg_notify('new_event', NEW.id::text);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Drop and recreate trigger (triggers can't use IF NOT EXISTS)
+DROP TRIGGER IF EXISTS events_notify_trigger ON events;
+CREATE TRIGGER events_notify_trigger
+    AFTER INSERT ON events
+    FOR EACH ROW
+    EXECUTE FUNCTION notify_new_event(
+
 CREATE TABLE IF NOT EXISTS events (
     id TEXT PRIMARY KEY,
     stream_name TEXT NOT NULL,

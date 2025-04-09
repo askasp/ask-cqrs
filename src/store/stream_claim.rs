@@ -52,15 +52,28 @@ impl StreamClaimer {
 
     pub async fn start_claiming(&self, stream_sender: mpsc::Sender<StreamClaim>, node_id: &str) {
         let mut interval = time::interval(Duration::from_secs(2)); // Adjust as needed
-
+        
+        // Create a listener for PostgreSQL notifications
+        let mut listener = sqlx::postgres::PgListener::connect_with(&self.pool).await.unwrap();
+        listener.listen("new_event").await.unwrap();
+        
+        info!("Listening for new event notifications");
+        
         loop {
             // Try to claim streams without waiting first
             match self.claim_streams(10, node_id).await {
                 Ok(streams) => {
                     info!("Claimed {} streams", streams.len());
                     if streams.is_empty() {
-                        info!("No streams to claim, waiting for interval");
-                        interval.tick().await;
+                        // Wait for either the interval or a notification
+                        tokio::select! {
+                            _ = interval.tick() => {
+                                info!("No streams to claim, interval tick");
+                            },
+                           _ = listener.recv() => {
+                                continue;
+                            }
+                        }
                     } else {
                         for stream in streams {
                             if stream_sender.send(stream).await.is_err() {
@@ -75,7 +88,6 @@ impl StreamClaimer {
                     interval.tick().await; // Wait before retrying
                 }
             }
-
         }
     }
 
