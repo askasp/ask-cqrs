@@ -17,7 +17,9 @@ pub trait ViewStore: Send + Sync + Clone {
     async fn initialize(&self) -> Result<()>;
     
     /// Get a view state for a partition
-    async fn get_view_state<V: View>(&self, partition_key: &str) -> Result<Option<V>>;
+    async fn get_view_state<V: View>(&self, partition_key: &str) -> Result<Option<V>>{
+        Err(anyhow::anyhow!("Not implemented"))
+    }
     
     /// Save a view state for a partition
     async fn save_view_state<V: View>(
@@ -25,14 +27,18 @@ pub trait ViewStore: Send + Sync + Clone {
         partition_key: &str,
         view: &V,
         event_row: &EventRow,
-    ) -> Result<()>;
+    ) -> Result<()> {
+        Err(anyhow::anyhow!("Not implemented"))
+    }
     
     /// Check if an event has already been processed by this view partition
     async fn is_event_processed<V: View>(
         &self,
         partition_key: &str,
         event_row: &EventRow,
-    ) -> Result<bool>;
+    ) -> Result<bool> {
+        Err(anyhow::anyhow!("Not implemented"))
+    }
     
     /// Query views by criteria in their state
     async fn query_views<V: View>(
@@ -40,7 +46,10 @@ pub trait ViewStore: Send + Sync + Clone {
         condition: &str,
         params: Vec<JsonValue>,
         pagination: Option<PaginationOptions>,
-    ) -> Result<PaginatedResult<V>>;
+    ) -> Result<PaginatedResult<V>> {
+        Err(anyhow::anyhow!("Not implemented"))
+    }
+    
     
     /// Wait for a view to catch up to a specific event
     async fn wait_for_view<V: View + Default>(
