@@ -94,6 +94,45 @@ impl PostgresViewStore {
 
         Ok(row.get::<bool, _>(0))
     }
+    
+    /// Reset a view by deleting all its snapshots and handler offsets
+    /// This will cause the view to be rebuilt from scratch when restarted
+    #[instrument(skip(self))]
+    pub async fn reset_view<V: View>(&self) -> Result<()> {
+        let view_name = V::name();
+        info!("Resetting view: {}", view_name);
+        
+        // Start a transaction to ensure both operations succeed or fail together
+        let mut tx = self.pool.begin().await?;
+        
+        // Delete all view snapshots for this view
+        let deleted_snapshots = sqlx::query(
+            "DELETE FROM view_snapshots WHERE view_name = $1"
+        )
+        .bind(view_name)
+        .execute(&mut *tx)
+        .await?;
+        
+        // Delete all handler offsets for this view
+        let deleted_offsets = sqlx::query(
+            "DELETE FROM handler_stream_offsets WHERE handler = $1"
+        )
+        .bind(view_name)
+        .execute(&mut *tx)
+        .await?;
+        
+        // Commit the transaction
+        tx.commit().await?;
+        
+        info!(
+            "Reset view {}: deleted {} snapshots and {} handler offsets",
+            view_name,
+            deleted_snapshots.rows_affected(),
+            deleted_offsets.rows_affected()
+        );
+        
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -463,7 +502,6 @@ impl ViewStore for PostgresViewStore {
     async fn wait_for_view<V: View + Default>(
         &self,
         event: &EventRow,
-        partition_key: &str,
         timeout_ms: u64,
     ) -> Result<()> {
         let stream_name = &event.stream_name;
@@ -476,14 +514,14 @@ impl ViewStore for PostgresViewStore {
         
         debug!(
             "Waiting for view {} to catch up to event in stream {}/{} at position {}",
-            partition_key, stream_name, stream_id, position
+            handler_name, stream_name, stream_id, position
         );
         
         loop {
             if start.elapsed() > timeout {
                 return Err(anyhow!(
                     "Timeout waiting for view {} to catch up to position {} for stream {}/{}",
-                    partition_key, position, stream_name, stream_id
+                    handler_name, position, stream_name, stream_id
                 ));
             }
 
@@ -512,7 +550,7 @@ impl ViewStore for PostgresViewStore {
                     if current_position >= position {
                         debug!(
                             "View {} caught up to position {} for stream {}/{}",
-                            partition_key, position, stream_name, stream_id
+                            handler_name, position, stream_name, stream_id
                         );
                         return Ok(());
                     }
@@ -523,6 +561,50 @@ impl ViewStore for PostgresViewStore {
             }
             
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
+    }
+    
+    /// Wait for a view to catch up to all events in all streams
+    /// This will check if there are any unprocessed events for the view
+    #[instrument(skip(self))]
+    async fn wait_for_view_to_catch_up<V: View + Default>(
+        &self,
+        timeout_ms: u64,
+    ) -> Result<()> {
+        let handler_name = V::name();
+        info!("Waiting for view {} to catch up to all events", handler_name);
+        
+        // Find the latest event in the database
+        let latest_event = sqlx::query(
+            "SELECT id, stream_name, stream_id, event_data, metadata, stream_position, created_at
+             FROM events
+             ORDER BY stream_position DESC
+             LIMIT 1"
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        
+        if let Some(row) = latest_event {
+            let event = EventRow {
+                id: row.get("id"),
+                stream_name: row.get("stream_name"),
+                stream_id: row.get("stream_id"),
+                event_data: row.get("event_data"),
+                metadata: row.get("metadata"),
+                stream_position: row.get("stream_position"),
+                created_at: row.get("created_at"),
+            };
+            
+            info!(
+                "Found latest event at position {} in stream {}/{}",
+                event.stream_position, event.stream_name, event.stream_id
+            );
+            
+            // Wait for the view to catch up to this event
+            self.wait_for_view::<V>(&event, timeout_ms).await
+        } else {
+            info!("No events found in the database, view is already caught up");
+            Ok(())
         }
     }
 } 

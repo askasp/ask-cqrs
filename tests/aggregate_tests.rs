@@ -112,7 +112,7 @@ async fn test_bank_account_duplicate_open() -> Result<(), anyhow::Error> {
 #[serial_test::serial]
 async fn test_bank_account_nonexistent() -> Result<(), anyhow::Error> {
     initialize_logger();
-    let store = create_test_database("postgres://postgres:postgres@localhost:5432/", "ask_cqrs_test3").await?;
+    let store = create_test_database("postgres://postgres:postgres@localhost:5432/", "ask_cqrs_test2").await?;
     
     // Try to deposit to nonexistent account
     let account_id = Uuid::new_v4().to_string();

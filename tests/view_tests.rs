@@ -47,7 +47,7 @@ async fn test_bank_account_view_async() -> Result<(), anyhow::Error> {
     let last_event = result.events.last().expect("At least one event should be created");
     
     // Wait for view to catch up using the exact event
-    view_store.wait_for_view::<BankAccountView>(last_event, &last_event.stream_id, VIEW_TIMEOUT_MS).await?;
+    view_store.wait_for_view::<BankAccountView>(last_event, VIEW_TIMEOUT_MS).await?;
 
     // Deposit funds
     let result = store.execute_command::<BankAccountAggregate>(
@@ -63,7 +63,7 @@ async fn test_bank_account_view_async() -> Result<(), anyhow::Error> {
     let last_event = result.events.last().expect("At least one event should be created");
     
     // Wait for view to catch up using the exact event
-    view_store.wait_for_view::<BankAccountView>(last_event, &last_event.stream_id, VIEW_TIMEOUT_MS).await?;
+    view_store.wait_for_view::<BankAccountView>(last_event, VIEW_TIMEOUT_MS).await?;
 
     // Get view state - should be available now
     let view = view_store.get_view_state::<BankAccountView>(&result.stream_id).await?
@@ -102,7 +102,7 @@ async fn test_bank_liquidity_view() -> Result<(), anyhow::Error> {
 
     let last_event1 = result1.events.last().expect("At least one event should be created");
     tracing::info!("Created first account: {}", result1.stream_id);
-    view_store.wait_for_view::<BankLiquidityView>(last_event1, "aggregate", VIEW_TIMEOUT_MS).await?;
+    view_store.wait_for_view::<BankLiquidityView>(last_event1, VIEW_TIMEOUT_MS).await?;
     let view = view_store.get_view_state::<BankLiquidityView>("aggregate").await?.unwrap();
     assert_eq!(view.total_accounts, 1);
     tracing::info!("After first account: {:?}", view);
@@ -121,7 +121,7 @@ async fn test_bank_liquidity_view() -> Result<(), anyhow::Error> {
     tracing::info!("Created second account: {}", result2.stream_id);
     
     
-    view_store.wait_for_view::<BankLiquidityView>(last_event2, "aggregate", VIEW_TIMEOUT_MS).await?;
+    view_store.wait_for_view::<BankLiquidityView>(last_event2, VIEW_TIMEOUT_MS).await?;
     let view = view_store.get_view_state::<BankLiquidityView>("aggregate").await?.unwrap();
     tracing::info!("After second account, total_accounts = {}, expected 2", view.total_accounts);
     assert_eq!(view.total_accounts, 2);
@@ -138,7 +138,7 @@ async fn test_bank_liquidity_view() -> Result<(), anyhow::Error> {
     ).await?;
     let last_event = result.events.last().expect("At least one event should be created");
 
-    view_store.wait_for_view::<BankLiquidityView>(last_event, "aggregate", VIEW_TIMEOUT_MS).await?;
+    view_store.wait_for_view::<BankLiquidityView>(last_event, VIEW_TIMEOUT_MS).await?;
     let view = view_store.get_view_state::<BankLiquidityView>("aggregate").await?.unwrap();
     assert_eq!(view.total_balance, 1000);
     tracing::info!("After first deposit: {:?}", view);
@@ -153,7 +153,7 @@ async fn test_bank_liquidity_view() -> Result<(), anyhow::Error> {
     ).await?;
     let last_event = result.events.last().expect("At least one event should be created");
 
-    view_store.wait_for_view::<BankLiquidityView>(last_event, "aggregate", VIEW_TIMEOUT_MS).await?;
+    view_store.wait_for_view::<BankLiquidityView>(last_event, VIEW_TIMEOUT_MS).await?;
     let view = view_store.get_view_state::<BankLiquidityView>("aggregate").await?.unwrap();
     assert_eq!(view.total_balance, 1500);
     tracing::info!("After second deposit: {:?}", view);
@@ -169,7 +169,7 @@ async fn test_bank_liquidity_view() -> Result<(), anyhow::Error> {
     ).await?;
     let last_event = result.events.last().expect("At least one event should be created");
 
-    view_store.wait_for_view::<BankLiquidityView>(last_event, "aggregate", VIEW_TIMEOUT_MS).await?;
+    view_store.wait_for_view::<BankLiquidityView>(last_event, VIEW_TIMEOUT_MS).await?;
     let view = view_store.get_view_state::<BankLiquidityView>("aggregate").await?.unwrap();
     assert_eq!(view.total_balance, 1200);
     tracing::info!("After withdrawal: {:?}", view);
@@ -212,7 +212,7 @@ async fn test_view_query_pagination() -> Result<(), anyhow::Error> {
     ).await?;
 
     let last_event1 = result1.events.last().expect("At least one event should be created");
-    view_store.wait_for_view::<BankAccountView>(last_event1, &result1.stream_id, VIEW_TIMEOUT_MS).await?;
+    view_store.wait_for_view::<BankAccountView>(last_event1, VIEW_TIMEOUT_MS).await?;
 
     let result2 = store.execute_command::<BankAccountAggregate>(
         BankAccountCommand::OpenAccount { 
@@ -224,7 +224,7 @@ async fn test_view_query_pagination() -> Result<(), anyhow::Error> {
     ).await?;
 
     let last_event2 = result2.events.last().expect("At least one event should be created");
-    view_store.wait_for_view::<BankAccountView>(last_event2, &result2.stream_id, VIEW_TIMEOUT_MS).await?;
+    view_store.wait_for_view::<BankAccountView>(last_event2, VIEW_TIMEOUT_MS).await?;
 
     // Test pagination
     let page1 = view_store.query_views::<BankAccountView>(
@@ -314,7 +314,7 @@ async fn test_view_start_from_beginning() -> Result<(), anyhow::Error> {
     let last_event = events.last().expect("At least one event should exist");
     
     // Wait for view to catch up
-    view_store.wait_for_view::<BankAccountView>(last_event, &account_id, VIEW_TIMEOUT_MS).await?;
+    view_store.wait_for_view::<BankAccountView>(last_event, VIEW_TIMEOUT_MS).await?;
 
     // Get view state - should have processed all events from the beginning
     let view = view_store.get_view_state::<BankAccountView>(&account_id).await?
@@ -324,5 +324,86 @@ async fn test_view_start_from_beginning() -> Result<(), anyhow::Error> {
     assert_eq!(view.balance, 800, "Balance should reflect all deposits (500+300)");
     assert_eq!(view.user_id, user_id);
 
+    Ok(())
+}
+
+#[tokio::test]
+#[instrument]
+#[serial]
+async fn test_view_reset() -> Result<(), anyhow::Error> {
+    initialize_logger();
+    let store = Arc::new(create_test_store("postgres://postgres:postgres@localhost:5432/ask_cqrs_test2").await?);
+    
+    // Create view store
+    let view_store = store.create_view_store();
+    
+    // Generate unique user ID
+    let user_id = Uuid::new_v4().to_string();
+
+    // First create some events without the view running
+    let result1 = store.execute_command::<BankAccountAggregate>(
+        BankAccountCommand::OpenAccount { 
+            user_id: user_id.clone(),
+            account_id: None,
+        },
+        (),
+        json!({"user_id": user_id}),
+    ).await?;
+    let account_id = result1.stream_id.clone();
+    
+    // Add some deposits
+    store.execute_command::<BankAccountAggregate>(
+        BankAccountCommand::DepositFunds { 
+            amount: 500,
+            account_id: account_id.clone(),
+        },
+        (),
+        json!({"user_id": user_id}),
+    ).await?;
+    
+    // Now start the view
+    tracing::info!("Starting view");
+    store.start_view::<BankAccountView>(view_store.clone(), None).await?;
+    
+    // Get the last created event to wait for
+    let events = store.get_events_for_stream("bank_account", &account_id, -1, 10).await?;
+    let last_event = events.last().expect("At least one event should exist");
+    
+    // Wait for view to catch up
+    view_store.wait_for_view::<BankAccountView>(last_event, VIEW_TIMEOUT_MS).await?;
+
+    // Get view state - should have processed all events
+    let view = view_store.get_view_state::<BankAccountView>(&account_id).await?
+        .expect("View should exist");
+    
+    tracing::info!("View state before reset: {:?}", view);
+    assert_eq!(view.balance, 500, "Expected balance to be 500");
+    
+    // Reset the view
+    tracing::info!("Resetting view");
+    store.reset_view::<BankAccountView>().await?;
+    
+    // Verify the view was reset
+    let view_after_reset = view_store.get_view_state::<BankAccountView>(&account_id).await?;
+    assert!(view_after_reset.is_none(), "View should not exist after reset");
+    
+    // Restart the view with start_from_beginning=true
+    tracing::info!("Restarting view with start_from_beginning=true");
+    let config = EventProcessingConfig {
+        start_from_beginning: true,
+        ..Default::default()
+    };
+    store.start_view::<BankAccountView>(view_store.clone(), Some(config)).await?;
+    
+    // Wait for view to catch up again
+    view_store.wait_for_view::<BankAccountView>(last_event, VIEW_TIMEOUT_MS).await?;
+    
+    // Get view state again - should have processed all events again
+    let view_after_restart = view_store.get_view_state::<BankAccountView>(&account_id).await?
+        .expect("View should exist after restart");
+    
+    tracing::info!("View state after restart: {:?}", view_after_restart);
+    assert_eq!(view_after_restart.balance, 500, "Expected balance to be 500 after restart");
+    
     Ok(())
 } 

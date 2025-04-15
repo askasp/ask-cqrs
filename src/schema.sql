@@ -1,5 +1,17 @@
 -- Events table for storing all domain events
 
+
+CREATE TABLE IF NOT EXISTS events (
+    id TEXT PRIMARY KEY,
+    stream_name TEXT NOT NULL,
+    stream_id TEXT NOT NULL,
+    event_data JSONB NOT NULL,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    stream_position BIGINT NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(stream_id, stream_position)
+);
+
 CREATE OR REPLACE FUNCTION notify_new_event() RETURNS TRIGGER AS $$
 BEGIN
     PERFORM pg_notify('new_event', NEW.id::text);
@@ -13,17 +25,6 @@ CREATE TRIGGER events_notify_trigger
     AFTER INSERT ON events
     FOR EACH ROW
     EXECUTE FUNCTION notify_new_event();
-
-CREATE TABLE IF NOT EXISTS events (
-    id TEXT PRIMARY KEY,
-    stream_name TEXT NOT NULL,
-    stream_id TEXT NOT NULL,
-    event_data JSONB NOT NULL,
-    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-    stream_position BIGINT NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(stream_id, stream_position)
-);
 
 -- Indexes for efficient querying
 CREATE INDEX IF NOT EXISTS idx_events_stream ON events(stream_name);

@@ -66,6 +66,13 @@ impl PostgresEventStore {
         self.start_event_handler(view_handler, Some(config)).await?;
         Ok(())
     }
+    
+    /// Reset a view by deleting all its snapshots and handler offsets
+    /// This will cause the view to be rebuilt from scratch when restarted
+    pub async fn reset_view<V: View>(&self) -> Result<()> {
+        let view_store = self.create_view_store();
+        view_store.reset_view::<V>().await
+    }
 }
 
 #[async_trait]
