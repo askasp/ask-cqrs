@@ -288,7 +288,7 @@ impl EventProcessor {
         for row in rows {
             let retry_count: i32 = row.get("retry_count");
             let is_dead_lettered: bool = row.get("dead_lettered");
-            println!("Found event to process - Position: {}, Retry count: {}, Is dead lettered: {}", 
+            debug!("Found event to process - Position: {}, Retry count: {}, Is dead lettered: {}", 
                 row.get::<i64, _>("stream_position"), retry_count, is_dead_lettered);
             
             events.push(
@@ -359,7 +359,7 @@ impl EventProcessor {
         config: &EventProcessingConfig,
     ) -> Result<(), EventHandlerError> {
         // Get current retry info
-        println!("Setting processing error for handler {} on {}/{}", handler_name, event.stream_name, event.stream_id);
+        info!("Setting processing error for handler {} on {}/{}", handler_name, event.stream_name, event.stream_id);
         let row = sqlx::query(
             "SELECT retry_count, dead_lettered 
              FROM handler_stream_offsets
@@ -373,13 +373,13 @@ impl EventProcessor {
         
         let current_retry_count: i32 = row.get("retry_count");
         let is_dead_lettered: bool = row.get("dead_lettered");
-        println!("Current retry count: {}, Is dead lettered: {}", current_retry_count, is_dead_lettered);
+        info!("Current retry count: {}, Is dead lettered: {}", current_retry_count, is_dead_lettered);
         let new_retry_count = current_retry_count + 1;
-        println!("New retry count: {}", new_retry_count);
+        info!("New retry count: {}", new_retry_count);
         
         if new_retry_count > config.max_retries {
             // Mark as dead-lettered
-            println!("Marking as dead-lettered - retry count {} exceeds max retries {}", new_retry_count, config.max_retries);
+            warn!("Marking as dead-lettered - retry count {} exceeds max retries {}", new_retry_count, config.max_retries);
             sqlx::query(
                 "UPDATE handler_stream_offsets
                  SET dead_lettered = true,
@@ -414,9 +414,9 @@ impl EventProcessor {
         
         // Schedule retry
         let next_retry_at = Self::calculate_next_retry_time(new_retry_count, config);
-        println!("Next retry at: {}", next_retry_at);
-        println!("Retry count: {}", new_retry_count);
-        println!("about to update handler_stream_offsets with retry_count: {}", new_retry_count);
+        debug!("Next retry at: {}", next_retry_at);
+        debug!("Retry count: {}", new_retry_count);
+        debug!("Updating handler_stream_offsets with retry_count: {}", new_retry_count);
         let updated_row = sqlx::query(
             "UPDATE handler_stream_offsets
              SET retry_count = $4,
@@ -439,7 +439,7 @@ impl EventProcessor {
         
         let updated_retry_count: i32 = updated_row.get("retry_count");
         let updated_next_retry: Option<DateTime<Utc>> = updated_row.get("next_retry_at");
-        println!("Updated retry count: {}, Next retry at: {:?}", updated_retry_count, updated_next_retry);
+        debug!("Updated retry count: {}, Next retry at: {:?}", updated_retry_count, updated_next_retry);
         
         info!(
             "Scheduled retry #{} at {} for event at position {} for {}/{}, handler={}: {}",

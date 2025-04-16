@@ -178,7 +178,7 @@ impl ViewStore for PostgresViewStore {
         stream_name = %event_row.stream_name,
         stream_id = %event_row.stream_id,
         stream_position = event_row.stream_position
-    ))]
+    ), level = "debug")]
     async fn is_event_processed<V: View>(
         &self,
         partition_key: &str,
@@ -213,7 +213,7 @@ impl ViewStore for PostgresViewStore {
         stream_name = %event_row.stream_name,
         stream_id = %event_row.stream_id,
         stream_position = event_row.stream_position
-    ))]
+    ), level = "debug")]
     async fn save_view_state<V: View>(
         &self,
         partition_key: &str,
@@ -498,7 +498,7 @@ impl ViewStore for PostgresViewStore {
     }
     
     /// Wait for a view to catch up to a specific event
-    #[instrument(skip(self))]
+    #[instrument(skip(self), level = "debug")]
     async fn wait_for_view<V: View + Default>(
         &self,
         event: &EventRow,
