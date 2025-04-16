@@ -350,7 +350,7 @@ impl EventProcessor {
     }
 
     /// Record error and schedule retry for a failed event
-    #[instrument(skip(self, config))]
+    #[instrument(skip_all)]
     pub async fn set_processing_error(
         &self,
         handler_name: &str,
