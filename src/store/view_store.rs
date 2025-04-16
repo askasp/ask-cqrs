@@ -14,7 +14,9 @@ use crate::{
 #[async_trait]
 pub trait ViewStore: Send + Sync + Clone {
     /// Initialize the view store
-    async fn initialize(&self) -> Result<()>;
+    async fn initialize(&self) -> Result<()>{
+        Err(anyhow::anyhow!("Not implemented"))
+    }
     
     /// Get a view state for a partition
     async fn get_view_state<V: View>(&self, partition_key: &str) -> Result<Option<V>>{

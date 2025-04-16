@@ -10,7 +10,7 @@ mod common;
 use common::bank_account::{BankAccountAggregate, BankAccountCommand, BankAccountError, BankAccountEvent};
 use common::fraud_detection_handler::FraudDetectionHandler;
 use ask_cqrs::test_utils::{initialize_logger, create_test_store};
-use ask_cqrs::store::event_store::{EventStore, EventProcessingConfig};
+use ask_cqrs::store::event_store::{EventStore, EventProcessingConfig, CommandError};
 use ask_cqrs::event_handler::{EventHandler, EventRow};
 
 #[tokio::test]
@@ -97,8 +97,8 @@ async fn test_fraud_detection_handler() -> Result<(), anyhow::Error> {
     }
 
     assert!(matches!(
-        result.unwrap_err().downcast::<BankAccountError>().unwrap(),
-        BankAccountError::AccountSuspended
+        result.unwrap_err(),
+        CommandError::Domain(BankAccountError::AccountSuspended)
     ));
 
     // Cleanup
@@ -288,8 +288,8 @@ async fn test_fraud_detection_start_from_current() -> Result<(), anyhow::Error> 
     }
     
     assert!(matches!(
-        final_withdraw_result.unwrap_err().downcast::<BankAccountError>().unwrap(),
-        BankAccountError::AccountSuspended
+        final_withdraw_result.unwrap_err(),
+        CommandError::Domain(BankAccountError::AccountSuspended)
     ), "Account should be suspended after new large withdrawal");
     
     // Cleanup

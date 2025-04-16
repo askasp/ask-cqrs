@@ -4,12 +4,28 @@ use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 use chrono::{DateTime, Utc};
 use serde::{Serialize, Deserialize};
+use thiserror::Error;
+use sqlx::Error as SqlxError;
+use serde_json::Error as SerdeJsonError;
 
 use crate::{
     aggregate::Aggregate,
     command::DomainCommand,
     event_handler::{EventHandler, EventRow},
 };
+
+/// Error type for command execution that can wrap both domain errors and database errors
+#[derive(Error, Debug)]
+pub enum CommandError<E> {
+    #[error("Domain error: {0}")]
+    Domain(#[from] E),
+    #[error("Database error: {0}")]
+    Database(SqlxError),
+    #[error("Serialization error: {0}")]
+    Serialization(SerdeJsonError),
+    #[error("Other error: {0}")]
+    Other(anyhow::Error),
+}
 
 /// An event that has permanently failed processing and was moved to the dead letter queue
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,7 +121,7 @@ pub trait EventStore: Send + Sync + Clone {
         command: A::Command,
         service: A::Service,
         metadata: JsonValue,
-    ) -> Result<CommandResult>
+    ) -> Result<CommandResult, CommandError<A::DomainError>>
     where
         A::Command: DomainCommand;
     

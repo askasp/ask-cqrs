@@ -1,9 +1,9 @@
-use anyhow::{anyhow, Result};
+use anyhow::{ Result};
 use async_trait::async_trait;
 use serde_json::{self, Value as JsonValue};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{
-    postgres::{PgListener, PgPool},
+    postgres::{ PgPool},
     Row,
 };
 use tokio::sync::mpsc;
@@ -11,9 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, info_span, instrument, trace, warn, Span};
 use uuid::Uuid;
-use std::collections::HashMap;
-use sqlx::postgres::{ PgConnectOptions};
-use sqlx::{ConnectOptions, Executor};
+use sqlx::{ Executor};
 
 use crate::store::{StreamClaim, StreamClaimer};
 use crate::view_event_handler::ViewEventHandler;
@@ -22,7 +20,7 @@ use crate::{
     command::DomainCommand,
     event_handler::{EventHandler, EventHandlerError, EventRow},
     store::event_store::{
-        CommandResult, EventProcessingConfig, EventStore, PaginatedResult, PaginationOptions,
+        CommandResult, CommandError, EventProcessingConfig, EventStore, PaginatedResult, PaginationOptions,
     },
     view::View,
 };
@@ -196,7 +194,7 @@ impl EventStore for PostgresEventStore {
         command: A::Command,
         service: A::Service,
         metadata: JsonValue,
-    ) -> Result<CommandResult>
+    ) -> Result<CommandResult, CommandError<A::DomainError>>
     where
         A::Command: DomainCommand,
         A::State: Send,
@@ -205,19 +203,19 @@ impl EventStore for PostgresEventStore {
         info!("Executing command for stream: {}", stream_id);
         let stream_name = A::name();
 
-        let (state, last_position) = self.build_state::<A>(&stream_id).await?;
+        let (state, last_position) = self.build_state::<A>(&stream_id).await.map_err(|e| CommandError::Other(e))?;
 
-        let events = A::execute(&state, &command, &stream_id, service)?;
+        let events = A::execute(&state, &command, &stream_id, service).map_err(CommandError::Domain)?;
 
         // For new streams, start at position 1 instead of 0
         let next_position = last_position.unwrap_or(0) + 1;
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin().await.map_err(|e| CommandError::Database(e))?;
         let mut final_stream_position = next_position;
         let mut created_events = Vec::with_capacity(events.len());
 
         for (idx, event) in events.into_iter().enumerate() {
-            let event_json = serde_json::to_value(&event)?;
+            let event_json = serde_json::to_value(&event).map_err(|e| CommandError::Serialization(e))?;
             let stream_position = next_position + idx as i64;
             final_stream_position = stream_position;
             let id = Uuid::new_v4();
@@ -244,7 +242,8 @@ impl EventStore for PostgresEventStore {
             .bind(&metadata)
             .bind(stream_position)
             .fetch_one(&mut *tx)
-            .await?;
+            .await
+            .map_err(|e| CommandError::Database(e))?;
 
             // Create an EventRow for this event
             let created_event = EventRow {
@@ -261,7 +260,7 @@ impl EventStore for PostgresEventStore {
         }
 
         // Commit the transaction - notification will happen automatically via database trigger
-        tx.commit().await?;
+        tx.commit().await.map_err(|e| CommandError::Database(e))?;
 
         info!(
             events_count = created_events.len(),

@@ -6,7 +6,7 @@ mod common;
 
 use common::bank_account::{BankAccountAggregate, BankAccountCommand, BankAccountError};
 use ask_cqrs::test_utils::{create_test_database, create_test_database_with_schema, create_test_store, initialize_logger};
-use ask_cqrs::store::event_store::EventStore;
+use ask_cqrs::store::event_store::{EventStore, CommandError};
 
 #[tokio::test]
 #[instrument]
@@ -62,8 +62,8 @@ async fn test_bank_account_aggregate() -> Result<(), anyhow::Error> {
     .await;
     
     assert!(matches!(
-        result.unwrap_err().downcast::<BankAccountError>().unwrap(),
-        BankAccountError::InsufficientFunds
+        result.unwrap_err(),
+        CommandError::Domain(BankAccountError::InsufficientFunds)
     ));
 
     Ok(())
@@ -100,8 +100,8 @@ async fn test_bank_account_duplicate_open() -> Result<(), anyhow::Error> {
     .await;
 
     assert!(matches!(
-        result.unwrap_err().downcast::<BankAccountError>().unwrap(),
-        BankAccountError::AccountAlreadyExists
+        result.unwrap_err(),
+        CommandError::Domain(BankAccountError::AccountAlreadyExists)
     ));
 
     Ok(())
@@ -127,8 +127,8 @@ async fn test_bank_account_nonexistent() -> Result<(), anyhow::Error> {
     .await;
     
     assert!(matches!(
-        result.unwrap_err().downcast::<BankAccountError>().unwrap(),
-        BankAccountError::AccountNotFound
+        result.unwrap_err(),
+        CommandError::Domain(BankAccountError::AccountNotFound)
     ));
 
     Ok(())
