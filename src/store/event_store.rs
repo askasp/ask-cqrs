@@ -1,12 +1,12 @@
-use std::time::Duration;
 use anyhow::Result;
 use async_trait::async_trait;
-use serde_json::Value as JsonValue;
 use chrono::{DateTime, Utc};
-use serde::{Serialize, Deserialize};
-use thiserror::Error;
-use sqlx::Error as SqlxError;
+use serde::{Deserialize, Serialize};
 use serde_json::Error as SerdeJsonError;
+use serde_json::Value as JsonValue;
+use sqlx::Error as SqlxError;
+use std::time::Duration;
+use thiserror::Error;
 
 use crate::{
     aggregate::Aggregate,
@@ -69,7 +69,7 @@ pub struct PaginationOptions {
 }
 
 /// Result for paginated operations
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct PaginatedResult<T> {
     pub items: Vec<T>,
     pub total_count: i64,
@@ -113,8 +113,6 @@ impl Default for EventProcessingConfig {
 /// Core trait defining the Event Store interface
 #[async_trait]
 pub trait EventStore: Send + Sync + Clone {
-    
-    
     /// Execute a command and store resulting events
     async fn execute_command<A: Aggregate>(
         &self,
@@ -124,20 +122,20 @@ pub trait EventStore: Send + Sync + Clone {
     ) -> Result<CommandResult, CommandError<A::DomainError>>
     where
         A::Command: DomainCommand;
-    
+
     /// Build current state for an aggregate by replaying events
     async fn build_state<A: Aggregate>(
         &self,
         stream_id: &str,
     ) -> Result<(Option<A::State>, Option<i64>)>;
-    
+
     /// Start an event handler with competing consumer support
     async fn start_event_handler<H: EventHandler + Send + Sync + Clone + 'static>(
         &self,
         handler: H,
         config: Option<EventProcessingConfig>,
     ) -> Result<()>;
-    
+
     /// Get events for a stream starting from a position
     async fn get_events_for_stream(
         &self,
@@ -146,6 +144,4 @@ pub trait EventStore: Send + Sync + Clone {
         from_position: i64,
         limit: i32,
     ) -> Result<Vec<EventRow>>;
-
-    
 }
