@@ -10,10 +10,11 @@ use chrono::Utc;
 mod common;
 
 use ask_cqrs::store::{EventStore, ViewStore, postgres_event_store::PostgresEventStore, event_store::PaginationOptions};
-use ask_cqrs::event_handler::EventRow;
-use common::bank_account::{BankAccountAggregate, BankAccountCommand};
+use ask_cqrs::event_handler::{EventHandler, EventRow};
+use common::bank_account::{BankAccountAggregate, BankAccountCommand, BankAccountEvent};
 use common::bank_account_view::BankAccountView;
 use common::bank_liquidity_view::BankLiquidityView;
+use common::bank_notification_view::BankNotificationView;
 use ask_cqrs::test_utils::{initialize_logger};
 
 const VIEW_TIMEOUT_MS: u64 = 5000;
@@ -72,6 +73,89 @@ async fn test_bank_account_view_async() -> Result<(), anyhow::Error> {
     assert_eq!(view.balance, 100);
     assert_eq!(view.user_id, user_id);
 
+    Ok(())
+}
+
+#[tokio::test]
+#[instrument]
+#[serial]
+async fn test_duplicate_event_processing() -> Result<(), anyhow::Error> {
+    initialize_logger();
+    let store = Arc::new(create_test_store("postgres://postgres:postgres@localhost:5432/ask_cqrs_test2").await?);
+    
+    // Create view store
+    let view_store = store.create_view_store();
+    
+    // Start notification view
+    store.start_view::<BankNotificationView>(view_store.clone(), None).await?;
+    
+    // Create an account
+    let user_id = Uuid::new_v4().to_string();
+    let result = store.execute_command::<BankAccountAggregate>(
+        BankAccountCommand::OpenAccount { 
+            user_id: user_id.clone(),
+            account_id: None,
+        },
+        (),
+        json!({"user_id": user_id}),
+    ).await?;
+    let account_id = result.stream_id.clone();
+    let last_event = result.events.last().expect("At least one event should be created");
+    view_store.wait_for_view::<BankNotificationView>(last_event, VIEW_TIMEOUT_MS).await?;
+    
+    // Get the initial view state
+    let view_before = view_store.get_view_state::<BankNotificationView>(&account_id).await?
+        .expect("View should exist");
+    
+    tracing::info!("Initial view state: {:?}", view_before);
+    assert_eq!(view_before.notifications.len(), 1, "Should have 1 notification");
+    
+    // Now manually process the same event again by directly calling the view handler
+    // This simulates a duplicate event being processed
+    let event_handler = view_store.create_event_handler::<BankNotificationView>();
+    event_handler.handle_event(
+        BankAccountEvent::AccountOpened { 
+            user_id: user_id.clone(), 
+            account_id: account_id.clone() 
+        },
+        last_event.clone()
+    ).await?;
+    
+    // Get the view state after processing the duplicate event
+    let view_after = view_store.get_view_state::<BankNotificationView>(&account_id).await?
+        .expect("View should exist");
+    
+    tracing::info!("View state after duplicate event: {:?}", view_after);
+    
+    // Verify that the duplicate event didn't add another notification
+    assert_eq!(view_after.notifications.len(), 1, 
+        "Should still have only 1 notification after processing duplicate event");
+    
+    // Verify that the processed_stream_positions was properly updated
+    // We can check this indirectly by confirming the event is considered processed
+    let is_processed = view_store.is_event_processed::<BankNotificationView>(&account_id, last_event).await?;
+    assert!(is_processed, "Event should be marked as processed");
+    
+    // Now make a real change to verify normal processing still works
+    let deposit_result = store.execute_command::<BankAccountAggregate>(
+        BankAccountCommand::DepositFunds { 
+            amount: 100,
+            account_id: account_id.clone(),
+        },
+        (),
+        json!({"user_id": user_id}),
+    ).await?;
+    let deposit_event = deposit_result.events.last().expect("At least one event should be created");
+    view_store.wait_for_view::<BankNotificationView>(deposit_event, VIEW_TIMEOUT_MS).await?;
+    
+    // Get the view state after the deposit
+    let view_after_deposit = view_store.get_view_state::<BankNotificationView>(&account_id).await?
+        .expect("View should exist");
+    
+    tracing::info!("View state after deposit: {:?}", view_after_deposit);
+    assert_eq!(view_after_deposit.notifications.len(), 2, 
+        "Should have 2 notifications after deposit");
+    
     Ok(())
 }
 
@@ -406,4 +490,110 @@ async fn test_view_reset() -> Result<(), anyhow::Error> {
     assert_eq!(view_after_restart.balance, 500, "Expected balance to be 500 after restart");
     
     Ok(())
-} 
+}
+
+#[tokio::test]
+#[instrument]
+#[serial]
+async fn test_notification_view_with_update_all() -> Result<(), anyhow::Error> {
+    initialize_logger();
+    let store = Arc::new(create_test_store("postgres://postgres:postgres@localhost:5432/ask_cqrs_test2").await?);
+    
+    // Create view store
+    let view_store = store.create_view_store();
+    
+    // Start notification view
+    store.start_view::<BankNotificationView>(view_store.clone(), None).await?;
+    
+    // Create two accounts
+    let user1_id = Uuid::new_v4().to_string();
+    let user2_id = Uuid::new_v4().to_string();
+    
+    // Create first account
+    let result1 = store.execute_command::<BankAccountAggregate>(
+        BankAccountCommand::OpenAccount { 
+            user_id: user1_id.clone(),
+            account_id: None,
+        },
+        (),
+        json!({"user_id": user1_id}),
+    ).await?;
+    let account1_id = result1.stream_id.clone();
+    let last_event1 = result1.events.last().expect("At least one event should be created");
+    view_store.wait_for_view::<BankNotificationView>(last_event1, VIEW_TIMEOUT_MS).await?;
+    
+    // Create second account
+    let result2 = store.execute_command::<BankAccountAggregate>(
+        BankAccountCommand::OpenAccount { 
+            user_id: user2_id.clone(),
+            account_id: None,
+        },
+        (),
+        json!({"user_id": user2_id}),
+    ).await?;
+    let account2_id = result2.stream_id.clone();
+    let last_event2 = result2.events.last().expect("At least one event should be created");
+    view_store.wait_for_view::<BankNotificationView>(last_event2, VIEW_TIMEOUT_MS).await?;
+    
+    // Make some transactions on first account
+    let deposit_result = store.execute_command::<BankAccountAggregate>(
+        BankAccountCommand::DepositFunds { 
+            amount: 500,
+            account_id: account1_id.clone(),
+        },
+        (),
+        json!({"user_id": user1_id}),
+    ).await?;
+    let last_deposit_event = deposit_result.events.last().expect("At least one event should be created");
+    view_store.wait_for_view::<BankNotificationView>(last_deposit_event, VIEW_TIMEOUT_MS).await?;
+    
+    // Check notifications for first account
+    let view1 = view_store.get_view_state::<BankNotificationView>(&account1_id).await?
+        .expect("View should exist for account 1");
+    
+    tracing::info!("Account 1 notifications: {:?}", view1.notifications);
+    assert_eq!(view1.notifications.len(), 2, "Should have 2 notifications (open + deposit)");
+    assert!(view1.notifications[1].contains("Deposit of $500"), "Should have deposit notification");
+    assert_eq!(view1.global_notifications.len(), 0, "Should have no global notifications yet");
+    
+    // Check notifications for second account
+    let view2 = view_store.get_view_state::<BankNotificationView>(&account2_id).await?
+        .expect("View should exist for account 2");
+    
+    tracing::info!("Account 2 notifications: {:?}", view2.notifications);
+    assert_eq!(view2.notifications.len(), 1, "Should have 1 notification (open)");
+    assert_eq!(view2.global_notifications.len(), 0, "Should have no global notifications yet");
+    
+    // Now suspend the first account - this should trigger update_all
+    let suspend_result = store.execute_command::<BankAccountAggregate>(
+        BankAccountCommand::SuspendAccount { 
+            account_id: account1_id.clone(),
+        },
+        (),
+        json!({"user_id": user1_id}),
+    ).await?;
+    let last_suspend_event = suspend_result.events.last().expect("At least one event should be created");
+    view_store.wait_for_view::<BankNotificationView>(last_suspend_event, VIEW_TIMEOUT_MS).await?;
+    
+    // Check that both accounts received the global notification
+    let view1_after = view_store.get_view_state::<BankNotificationView>(&account1_id).await?
+        .expect("View should exist for account 1");
+    
+    tracing::info!("Account 1 notifications after suspend: {:?}", view1_after);
+    assert_eq!(view1_after.global_notifications.len(), 1, "Should have 1 global notification");
+    assert!(view1_after.global_notifications[0].contains("Account suspended"), 
+            "Should have suspension notification");
+    
+    let view2_after = view_store.get_view_state::<BankNotificationView>(&account2_id).await?
+        .expect("View should exist for account 2");
+    
+    tracing::info!("Account 2 notifications after suspend: {:?}", view2_after);
+    assert_eq!(view2_after.global_notifications.len(), 1, "Should have 1 global notification");
+    assert!(view2_after.global_notifications[0].contains("Account suspended"), 
+            "Should have suspension notification");
+    
+    // Verify account 2 still only has its original notification plus the global one
+    assert_eq!(view2_after.notifications.len(), 1, "Account 2 should still have only 1 notification");
+    
+    Ok(())
+}

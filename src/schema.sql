@@ -19,12 +19,18 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Drop and recreate trigger (triggers can't use IF NOT EXISTS)
-DROP TRIGGER IF EXISTS events_notify_trigger ON events;
-CREATE TRIGGER events_notify_trigger
-    AFTER INSERT ON events
-    FOR EACH ROW
-    EXECUTE FUNCTION notify_new_event();
+-- Only create trigger if events table exists
+DO $$
+BEGIN
+    IF EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'events') THEN
+        -- Drop and recreate trigger (triggers can't use IF NOT EXISTS)
+        DROP TRIGGER IF EXISTS events_notify_trigger ON events;
+        CREATE TRIGGER events_notify_trigger
+            AFTER INSERT ON events
+            FOR EACH ROW
+            EXECUTE FUNCTION notify_new_event();
+    END IF;
+END $$;
 
 -- Indexes for efficient querying
 CREATE INDEX IF NOT EXISTS idx_events_stream ON events(stream_name);
@@ -74,6 +80,7 @@ CREATE TABLE IF NOT EXISTS view_snapshots (
     view_name TEXT NOT NULL,
     partition_key TEXT NOT NULL,
     state JSONB NOT NULL,
+
     -- Map of "stream_name:stream_id" to stream position
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(view_name, partition_key)
@@ -84,3 +91,11 @@ CREATE INDEX IF NOT EXISTS idx_view_snapshots_lookup ON view_snapshots(view_name
 CREATE INDEX IF NOT EXISTS idx_handler_stream_offsets_lookup
     ON handler_stream_offsets (handler, stream_name, stream_id, last_position)
     WHERE dead_lettered = FALSE;
+    
+ALTER TABLE events DROP CONSTRAINT IF EXISTS events_stream_id_stream_position_key;
+
+-- Add the new unique constraint on stream_name and stream_position
+ALTER TABLE events ADD CONSTRAINT events_stream_name_stream_id_stream_position_key UNIQUE (stream_name, stream_id, stream_position); 
+
+-- Add processed_stream_positions column to view_snapshots to track which events have been applied
+ALTER TABLE view_snapshots ADD COLUMN IF NOT EXISTS processed_stream_positions JSONB NOT NULL DEFAULT '{}'::jsonb;

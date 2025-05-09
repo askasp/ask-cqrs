@@ -1,14 +1,10 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{self, json, Value as JsonValue};
 use sqlx::{postgres::PgPool, Row};
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::time::sleep;
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -16,6 +12,7 @@ use crate::{
     store::event_store::{PaginatedResult, PaginationOptions},
     store::view_store::ViewStore,
     view::View,
+    view_event_handler::ViewEventHandler,
 };
 
 /// Type to track stream positions in a type-safe way
@@ -129,6 +126,65 @@ impl PostgresViewStore {
 
         Ok(())
     }
+
+    /// Create an event handler for a view
+    /// This is primarily used for testing
+    pub fn create_event_handler<V: View + Default + 'static>(&self) -> ViewEventHandler<V> {
+        ViewEventHandler::new(self.clone())
+    }
+
+    /// Get all partition keys for a specific view
+    #[instrument(skip(self))]
+    pub async fn get_all_partitions<V: View>(&self) -> Result<Vec<String>> {
+        let view_name = V::name();
+
+        let rows = sqlx::query("SELECT partition_key FROM view_snapshots WHERE view_name = $1")
+            .bind(view_name)
+            .fetch_all(&self.pool)
+            .await?;
+
+        let partition_keys = rows
+            .into_iter()
+            .map(|row| row.get("partition_key"))
+            .collect();
+
+        Ok(partition_keys)
+    }
+
+    /// Get partition keys for a view based on a query condition on the state
+    ///
+    /// This allows filtering partitions based on properties in their state
+    /// For example, to get all partitions where the state has a specific user_id:
+    #[instrument(skip(self, params))]
+    pub async fn get_partitions_by_query<V: View>(
+        &self,
+        condition: &str,
+        params: Vec<JsonValue>,
+    ) -> Result<Vec<String>> {
+        let view_name = V::name();
+
+        let query = format!(
+            "SELECT partition_key 
+             FROM view_snapshots 
+             WHERE view_name = $1 
+             AND {}",
+            condition
+        );
+
+        let mut query_builder = sqlx::query(&query).bind(view_name);
+        for param in &params {
+            query_builder = query_builder.bind(param);
+        }
+
+        let rows = query_builder.fetch_all(&self.pool).await?;
+
+        let partition_keys = rows
+            .into_iter()
+            .map(|row| row.get("partition_key"))
+            .collect();
+
+        Ok(partition_keys)
+    }
 }
 
 #[async_trait]
@@ -180,25 +236,29 @@ impl ViewStore for PostgresViewStore {
         partition_key: &str,
         event_row: &EventRow,
     ) -> Result<bool> {
-        // Instead of checking view_snapshots.processed_stream_positions
-        // Check the handler_stream_offsets directly
+        // Check view_snapshots.processed_stream_positions to see if this specific view
+        // has processed this event for this partition
         let row = sqlx::query(
-            "SELECT last_position
-             FROM handler_stream_offsets 
-             WHERE handler = $1 
-             AND stream_name = $2
-             AND stream_id = $3",
+            "SELECT processed_stream_positions
+             FROM view_snapshots 
+             WHERE view_name = $1 
+             AND partition_key = $2",
         )
         .bind(V::name())
-        .bind(&event_row.stream_name)
-        .bind(&event_row.stream_id)
+        .bind(partition_key)
         .fetch_optional(&self.pool)
         .await?;
 
         if let Some(row) = row {
-            let last_position: i64 = row.get("last_position");
-            if event_row.stream_position <= last_position {
-                return Ok(true);
+            let positions_json: JsonValue = row.get("processed_stream_positions");
+            let positions = StreamPositions::from_json(positions_json)?;
+
+            if let Some(position) =
+                positions.get_position(&event_row.stream_name, &event_row.stream_id)
+            {
+                if event_row.stream_position <= position {
+                    return Ok(true);
+                }
             }
         }
 
@@ -609,4 +669,3 @@ impl ViewStore for PostgresViewStore {
         }
     }
 }
-
