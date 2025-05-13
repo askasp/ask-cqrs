@@ -95,7 +95,18 @@ CREATE INDEX IF NOT EXISTS idx_handler_stream_offsets_lookup
 ALTER TABLE events DROP CONSTRAINT IF EXISTS events_stream_id_stream_position_key;
 
 -- Add the new unique constraint on stream_name and stream_position
-ALTER TABLE events ADD CONSTRAINT events_stream_name_stream_id_stream_position_key UNIQUE (stream_name, stream_id, stream_position); 
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.table_constraints 
+        WHERE constraint_name = 'events_stream_name_stream_id_stream_position_key'
+          AND table_name = 'events'
+    ) THEN
+        ALTER TABLE events ADD CONSTRAINT events_stream_name_stream_id_stream_position_key 
+            UNIQUE (stream_name, stream_id, stream_position);
+    END IF;
+END $$;
 
 -- Add processed_stream_positions column to view_snapshots to track which events have been applied
 ALTER TABLE view_snapshots ADD COLUMN IF NOT EXISTS processed_stream_positions JSONB NOT NULL DEFAULT '{}'::jsonb;
