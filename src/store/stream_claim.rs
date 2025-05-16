@@ -1,12 +1,13 @@
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::Row;
-use tokio::sync::mpsc;
 use sqlx::PgPool;
-use tracing::{error, info};
+use sqlx::Row;
 use std::sync::Arc;
-use anyhow::Result;
+use tokio::sync::mpsc;
 use tokio::time::{self, Duration};
+use tracing::debug;
+use tracing::{error, info};
 
 use super::PostgresEventStore;
 
@@ -47,28 +48,33 @@ pub struct StreamClaimer {
 
 impl StreamClaimer {
     pub async fn new(store: &PostgresEventStore, handler_name: String) -> Result<Self> {
-        Ok(Self { pool: store.pool.clone(), handler_name })
+        Ok(Self {
+            pool: store.pool.clone(),
+            handler_name,
+        })
     }
 
     pub async fn start_claiming(&self, stream_sender: mpsc::Sender<StreamClaim>, node_id: &str) {
         let mut interval = time::interval(Duration::from_secs(2)); // Adjust as needed
-        
+
         // Create a listener for PostgreSQL notifications
-        let mut listener = sqlx::postgres::PgListener::connect_with(&self.pool).await.unwrap();
+        let mut listener = sqlx::postgres::PgListener::connect_with(&self.pool)
+            .await
+            .unwrap();
         listener.listen("new_event").await.unwrap();
-        
+
         info!("Listening for new event notifications");
-        
+
         loop {
             // Try to claim streams without waiting first
             match self.claim_streams(10, node_id).await {
                 Ok(streams) => {
-                    info!("Claimed {} streams", streams.len());
+                    debug!("Claimed {} streams", streams.len());
                     if streams.is_empty() {
                         // Wait for either the interval or a notification
                         tokio::select! {
                             _ = interval.tick() => {
-                                info!("No streams to claim, interval tick");
+                                debug!("No streams to claim, interval tick");
                             },
                            _ = listener.recv() => {
                                 continue;
@@ -82,7 +88,7 @@ impl StreamClaimer {
                         }
                         // Continue immediately to check for more streams
                     }
-                },
+                }
                 Err(e) => {
                     error!("Error claiming streams: {}", e);
                     interval.tick().await; // Wait before retrying
@@ -91,12 +97,7 @@ impl StreamClaimer {
         }
     }
 
-  
-    pub async fn release_claim(
-        &self,
-        stream_name: &str,
-        stream_id: &str,
-    ) -> Result<bool> {
+    pub async fn release_claim(&self, stream_name: &str, stream_id: &str) -> Result<bool> {
         let result = sqlx::query(
             r#"
             UPDATE handler_stream_offsets
@@ -115,19 +116,15 @@ impl StreamClaimer {
         .fetch_optional(&self.pool)
         .await?;
 
-        info!("Released claim for stream: {} {}", stream_name, stream_id);
+        debug!("Released claim for stream: {} {}", stream_name, stream_id);
 
         Ok(result.is_some())
     }
 
-    async fn claim_streams(
-        &self,
-        batch_size: i32,
-        node_id: &str,
-    ) -> Result<Vec<StreamClaim>> {
+    async fn claim_streams(&self, batch_size: i32, node_id: &str) -> Result<Vec<StreamClaim>> {
         let claim_duration = Duration::from_secs(30); // Adjust as needed
         let claim_until = Utc::now() + chrono::Duration::from_std(claim_duration).unwrap();
-        info!("Claiming streams until: {}", claim_until);
+        debug!("Claiming streams until: {}", claim_until);
 
         let rows = match sqlx::query(
             r#"
@@ -147,7 +144,8 @@ impl StreamClaimer {
         .bind(&self.handler_name)
         .bind(batch_size)
         .fetch_all(&self.pool)
-        .await {
+        .await
+        {
             Ok(rows) => rows,
             Err(e) => {
                 error!("Error fetching streams: {}", e);
@@ -155,7 +153,7 @@ impl StreamClaimer {
             }
         };
 
-        info!("Found {} streams to claim", rows.len());
+        debug!("Found {} streams to claim", rows.len());
 
         let mut claimed_streams = Vec::new();
         for row in rows {
