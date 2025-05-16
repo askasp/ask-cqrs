@@ -183,7 +183,7 @@ impl StreamClaimer {
 
             if let Some(row) = result {
                 // Successfully claimed, add to claimed_streams
-                info!("Claimed stream: {} {}", stream_name, stream_id);
+                debug!("Claimed stream: {} {}", stream_name, stream_id);
                 claimed_streams.push(StreamClaim {
                     stream_name,
                     stream_id,

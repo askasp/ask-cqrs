@@ -1,17 +1,14 @@
-use anyhow::{ Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{self, Value as JsonValue};
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{
-    postgres::{ PgPool},
-    Row,
-};
-use tokio::sync::mpsc;
+use sqlx::Executor;
+use sqlx::{postgres::PgPool, Row};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, info_span, instrument, trace, warn, Span};
 use uuid::Uuid;
-use sqlx::{ Executor};
 
 use crate::store::{StreamClaim, StreamClaimer};
 use crate::view_event_handler::ViewEventHandler;
@@ -20,7 +17,8 @@ use crate::{
     command::DomainCommand,
     event_handler::{EventHandler, EventHandlerError, EventRow},
     store::event_store::{
-        CommandResult, CommandError, EventProcessingConfig, EventStore, PaginatedResult, PaginationOptions,
+        CommandError, CommandResult, EventProcessingConfig, EventStore, PaginatedResult,
+        PaginationOptions,
     },
     view::View,
 };
@@ -46,7 +44,6 @@ impl PostgresEventStore {
             .connect(connection_string)
             .await?;
 
-
         let node_id = Uuid::new_v4().to_string();
         Ok(Self { pool, node_id })
     }
@@ -57,14 +54,18 @@ impl PostgresEventStore {
     pub fn create_view_store(&self) -> PostgresViewStore {
         PostgresViewStore::new(self.pool.clone())
     }
-    pub async fn start_view<V: View + Default>(&self, view_store: PostgresViewStore, config: Option<EventProcessingConfig>) -> Result<()> {
+    pub async fn start_view<V: View + Default>(
+        &self,
+        view_store: PostgresViewStore,
+        config: Option<EventProcessingConfig>,
+    ) -> Result<()> {
         let view_handler = ViewEventHandler::<V>::new(view_store);
         let mut config = config.unwrap_or_default();
         config.start_from_beginning = true;
         self.start_event_handler(view_handler, Some(config)).await?;
         Ok(())
     }
-    
+
     /// Reset a view by deleting all its snapshots and handler offsets
     /// This will cause the view to be rebuilt from scratch when restarted
     pub async fn reset_view<V: View>(&self) -> Result<()> {
@@ -140,7 +141,7 @@ impl EventStore for PostgresEventStore {
             info!("Starting event processor for handler: {}", handler_name);
 
             // Create an event processor with a dedicated connection
-            let  processor = match EventProcessor::new(&store).await {
+            let processor = match EventProcessor::new(&store).await {
                 Ok(processor) => processor,
                 Err(e) => {
                     error!("Failed to create event processor: {}", e);
@@ -149,20 +150,23 @@ impl EventStore for PostgresEventStore {
             };
             let _ = processor.initialize_offsets(&handler_name, &config).await;
 
-           
             let (sender, mut receiver) = mpsc::channel::<StreamClaim>(100); // Capacity of 100
-            let stream_claimer = StreamClaimer::new(&store, handler_name.clone()).await.unwrap();
+            let stream_claimer = StreamClaimer::new(&store, handler_name.clone())
+                .await
+                .unwrap();
             let arc_stream_claimer = Arc::new(stream_claimer);
             let arc_stream_claimer_clone = arc_stream_claimer.clone();
             info!("Starting stream claimer for handler: {}", handler_name);
             tokio::spawn(async move {
                 info!("Starting stream claimer for handler in thread");
-                arc_stream_claimer_clone.start_claiming(sender, &node_id).await;
+                arc_stream_claimer_clone
+                    .start_claiming(sender, &node_id)
+                    .await;
             });
-            
+
             // Create a processor that can be cloned
             let processor = Arc::new(processor);
-            
+
             while let Some(stream_claim) = receiver.recv().await {
                 // Clone necessary data for the task
                 let handler_name_clone = handler_name.clone();
@@ -171,24 +175,28 @@ impl EventStore for PostgresEventStore {
                 let handler_clone = handler.clone();
 
                 let stream_claimer_clone = arc_stream_claimer.clone();
-                
+
                 // Spawn a task to process this specific stream
                 tokio::spawn(async move {
-                    let _ = processor_clone.process_stream::<H>(
-                        handler_clone,
-                        &stream_claim.stream_name,
-                        &stream_claim.stream_id,
-                        stream_claim.last_position,
-                        &config_clone,
-                        &handler_name_clone
-                    ).await;
-                    let _ = stream_claimer_clone.release_claim(&stream_claim.stream_name, &stream_claim.stream_id).await;
+                    let _ = processor_clone
+                        .process_stream::<H>(
+                            handler_clone,
+                            &stream_claim.stream_name,
+                            &stream_claim.stream_id,
+                            stream_claim.last_position,
+                            &config_clone,
+                            &handler_name_clone,
+                        )
+                        .await;
+                    let _ = stream_claimer_clone
+                        .release_claim(&stream_claim.stream_name, &stream_claim.stream_id)
+                        .await;
                 });
             }
         });
         Ok(())
     }
-    
+
     async fn execute_command<A: Aggregate>(
         &self,
         command: A::Command,
@@ -200,22 +208,31 @@ impl EventStore for PostgresEventStore {
         A::State: Send,
     {
         let stream_id = command.stream_id();
-        info!("Executing command for stream: {}", stream_id);
+        debug!("Executing command for stream: {}", stream_id);
         let stream_name = A::name();
 
-        let (state, last_position) = self.build_state::<A>(&stream_id).await.map_err(|e| CommandError::Other(e))?;
+        let (state, last_position) = self
+            .build_state::<A>(&stream_id)
+            .await
+            .map_err(|e| CommandError::Other(e))?;
 
-        let events = A::execute(&state, &command, &stream_id, service).map_err(CommandError::Domain)?;
+        let events =
+            A::execute(&state, &command, &stream_id, service).map_err(CommandError::Domain)?;
 
         // For new streams, start at position 1 instead of 0
         let next_position = last_position.unwrap_or(0) + 1;
 
-        let mut tx = self.pool.begin().await.map_err(|e| CommandError::Database(e))?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| CommandError::Database(e))?;
         let mut final_stream_position = next_position;
         let mut created_events = Vec::with_capacity(events.len());
 
         for (idx, event) in events.into_iter().enumerate() {
-            let event_json = serde_json::to_value(&event).map_err(|e| CommandError::Serialization(e))?;
+            let event_json =
+                serde_json::to_value(&event).map_err(|e| CommandError::Serialization(e))?;
             let stream_position = next_position + idx as i64;
             final_stream_position = stream_position;
             let id = Uuid::new_v4();
@@ -327,9 +344,9 @@ impl EventStore for PostgresEventStore {
 }
 
 pub async fn initialize_database(connection_string: &str) -> Result<()> {
-        // Build the connection string for the new database
-        
-        // Now connect to the new database and initialize schema
+    // Build the connection string for the new database
+
+    // Now connect to the new database and initialize schema
     warn!("Initializing database");
     let db_pool = PgPool::connect(connection_string).await?;
 
